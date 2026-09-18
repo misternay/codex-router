@@ -3683,6 +3683,23 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     if (!deepSeekResponses) routed.reasoning_effort = childEffort;
     routed.reasoning = { ...(routed.reasoning || {}), effort: childEffort };
   }
+  // A routed Chat call carries the depth it decided in a field LiteLLM does not
+  // know, because the parameter it *does* know does not survive the gateway.
+  // LiteLLM's Responses bridge derives `reasoning_effort` from `reasoning` and
+  // then drops it again: its parameter filter only keeps fields the deployment's
+  // model label is known to support, and every label here is this router's own
+  // gateway id. Measured on 18 September 2026 against opencode Go: the provider
+  // body carried no `reasoning_effort` for `deepseek-v4.1-flash` or
+  // `glm-5.3-flash`, while LiteLLM's chat surface passed the same value through.
+  // An unrecognized field crosses the bridge untouched -- `client_metadata`
+  // proved the channel before this -- so the API forwarder, which owns the
+  // provider's own ladder, restores it there. Native Responses routes keep
+  // `reasoning.effort`, which reaches their provider by itself.
+  if (chatCompletionsProvider && !provider?.keyless) {
+    const decided = routed.reasoning?.effort ?? routed.reasoning_effort;
+    if (typeof decided === "string" && decided) routed.router_reasoning_effort = decided;
+    else delete routed.router_reasoning_effort;
+  }
   normalizeAutoToolChoice(routed, route);
   // Native OpenAI traffic keeps client_metadata; routed providers do not
   // consume it and the strict ones reject the unknown field.

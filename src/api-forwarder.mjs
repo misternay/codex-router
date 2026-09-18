@@ -1031,6 +1031,25 @@ function normalizeBody(buffer, contentType, route) {
   }
 
   payload.model = model.upstreamModel;
+  // The router labels a routed Chat call with the depth it decided, in a field
+  // LiteLLM's Responses bridge does not recognize and therefore relays instead
+  // of dropping (see the comment on the router side). LiteLLM's own
+  // `reasoning_effort` support check only knows OpenAI's own model labels, so
+  // this is the channel that survives a gateway id. Restore the value onto this
+  // model's declared ladder here, where the ladder already lives, and never let
+  // the marker reach the provider.
+  if (payload.router_reasoning_effort !== undefined) {
+    const requested = payload.router_reasoning_effort;
+    const levels = (model.reasoningLevels || []).map((level) => level.effort);
+    // One declared rung is not a ladder: those entries either have no effort
+    // control or reject every value but their own, and the profile chain below
+    // drops the parameter for them.
+    const effort = levels.length > 1 && typeof requested === "string"
+      ? declaredEffort(requested, levels)
+      : undefined;
+    if (effort) payload.reasoning_effort = effort;
+    delete payload.router_reasoning_effort;
+  }
   // Embeddings have their own wire contract. Keep every provider-specific
   // input field unchanged and never send the body through a chat adapter.
   if (route === "/embeddings") {

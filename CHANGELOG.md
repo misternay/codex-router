@@ -1,6 +1,27 @@
 # Changelog
 
 ## Unreleased
+- **A routed Chat call now reaches the provider with the depth it was routed
+  on.** LiteLLM only keeps `reasoning_effort` for a deployment whose model label
+  it recognizes, and every routed deployment is named with this router's own
+  gateway id, so the parameter was dropped on the way out: measured against
+  opencode Go on 18 September 2026, the provider body carried no
+  `reasoning_effort` for `deepseek-v4.1-flash` or `glm-5.3-flash`, while the
+  vendor itself honours the field (the same prompt reasoned for 736 tokens at
+  `low` and 1132 at `max`). The Codex-dry tandem therefore ran every turn at the
+  provider's default instead of the depth Jev chose, and a hand-picked rung in
+  the picker changed nothing. Neither the nested `reasoning` it already sends
+  nor `allowed_openai_params` (honoured on LiteLLM's chat surface, ignored on
+  `/v1/responses`), `model_info.supports_reasoning`, `base_model`,
+  `LITELLM_MODEL_COST_MAP` or `register_model()` moved it, and the deployment's
+  own `litellm_params.reasoning_effort` is filtered by the same check. A field
+  LiteLLM does not recognize crosses its Responses bridge untouched -- the
+  channel `client_metadata` already uses -- so the router labels a routed Chat
+  call with the depth it decided and the API forwarder, which owns each model's
+  ladder, restores it onto the rungs that model declares (`low`/`high`/`max` for
+  DeepSeek and GLM-5.3, top-rungs-mean-deepest, at or below the request, nothing
+  at all for a single-rung entry). Native Responses routes are unchanged: their
+  `reasoning.effort` already arrives.
 - **A native session handed to a Chat thinking route no longer 400s on the
   reasoning the vendor never got.** DeepSeek's thinking mode expects the chain
   of thought of every previous turn as soon as a request carries `tools`, and
