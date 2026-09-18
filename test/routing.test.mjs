@@ -8783,6 +8783,10 @@ test("reasoning ciphertext is not billed to the prompt-token estimate", async ()
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    // This test measures the prompt-token estimate against a full replay, so
+    // it states the conversation window it is exercising instead of inheriting
+    // a default that trims the transcript the estimate is meant to cover.
+    CODEX_ROUTER_CONVERSATION_WINDOW: "0",
     MODEL_ROUTER_STATE_DIR: stateDir,
   });
   const headers = {
@@ -8939,6 +8943,10 @@ test("router ages consumed large tool results but preserves the newest result fr
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_QUIET: "1",
+    // Aging and the conversation window are separate passes, and this test
+    // pins the aging one. The window would drop the aged result it inspects,
+    // so the test states the window it exercises instead of a default.
+    CODEX_ROUTER_CONVERSATION_WINDOW: "0",
     MODEL_ROUTER_STATE_DIR: stateDir,
   });
   const large = `old-head\n${"old-middle\n".repeat(4_000)}old-tail`;
@@ -8997,6 +9005,74 @@ test("router ages consumed large tool results but preserves the newest result fr
     });
     assert.equal(exactResponse.status, 200, await exactResponse.text());
     assert.equal(gatewayBodies[1].input[1].output, large);
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// The router cannot send "just the request": routed turns are stateless, so
+// the client replays the whole conversation on every turn. The window is what
+// stops that replay from being billed at full size, so this pins the effect
+// end-to-end rather than only through the helper's own unit tests.
+test("a long routed conversation is replayed as a window instead of in full", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-conversation-window-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  });
+  const filler = "z".repeat(6_000);
+  const input = [
+    { type: "message", role: "system", content: "Operator rules." },
+    ...Array.from({ length: 20 }, (_, index) => [
+      { type: "message", role: "user", content: `question ${index}` },
+      { type: "message", role: "assistant", content: `answer ${index} ${filler}` },
+    ]).flat(),
+    { type: "message", role: "user", content: "and now the follow-up?" },
+  ];
+  const forwardedIncludes = (forwarded, item) =>
+    forwarded.some((candidate) => JSON.stringify(candidate) === JSON.stringify(item));
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input }),
+    });
+    assert.equal(response.status, 200, await response.text());
+
+    const forwarded = gatewayBodies[0].input;
+    assert.ok(forwarded.length < input.length, "the router replayed the whole conversation");
+    // The rules the operator wrote survive whatever their age.
+    assert.equal(forwardedIncludes(forwarded, input[0]), true, "the instructions were dropped");
+    // The request being answered is still the last thing the model reads, and
+    // the turn it follows is kept with it.
+    assert.deepEqual(forwarded.at(-1), input.at(-1));
+    assert.equal(forwardedIncludes(forwarded, input.at(-2)), true, "the follow-up lost its turn");
+    // The oldest consumed turn is gone.
+    assert.equal(forwardedIncludes(forwarded, input[1]), false);
+    // Nothing was rewritten behind the operator's back: what survives is a
+    // suffix of the original conversation.
+    const tail = forwarded.slice(-4);
+    assert.deepEqual(tail, input.slice(-4));
+
+    const [event] = await waitForUsageEvents(stateDir, 1, router);
+    assert.equal(event.conversationWindowRan, true);
+    assert.ok(event.conversationWindowBytesSaved > 0, "the saving was not recorded");
+    assert.ok(event.conversationWindowItemsDropped > 0);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);

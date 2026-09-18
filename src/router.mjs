@@ -246,6 +246,11 @@ import {
   nativeToolResultAgingEnabled,
   toolResultAgingEnabled,
 } from "./tool-result-aging-state.mjs";
+import {
+  conversationWindowEnabled,
+  conversationWindowTailBytes,
+  windowConversation,
+} from "./conversation-window.mjs";
 import { VERSION } from "./version.mjs";
 import {
   nativeSessionHeaders,
@@ -3756,16 +3761,26 @@ async function prepareRoutedRequest({
   const aged = ageToolResults(normalizedInput, {
     enabled: agingEnabled,
   });
+  // A routed turn leaves here as a full conversation replay, so the already
+  // consumed middle is dropped before the request is built. The newest slice
+  // plus the current turn is kept byte-for-byte, and the cut is deterministic,
+  // so the pinned instruction head keeps matching the provider's prompt cache
+  // instead of being invalidated on every turn.
+  const windowed = windowConversation(aged.input, {
+    enabled: conversationWindowEnabled(),
+    tailBytes: conversationWindowTailBytes(),
+  });
   const built = await buildRoutedRequest({
     request,
     payload,
     route,
-    agedInput: aged.input,
+    agedInput: windowed.input,
   });
   return {
     ...built,
-    agedInput: aged.input,
+    agedInput: windowed.input,
     toolResultAging: aged.stats,
+    conversationWindow: windowed.stats,
   };
 }
 
@@ -4034,6 +4049,7 @@ async function handleResponses(request, response, requestUrl) {
   let usage;
   let estimatedInputTokens;
   let toolResultAging;
+  let conversationWindow;
   let pendingInterrupts = [];
   let emptyCompletion = false;
   let emptyCompletionRetried = false;
@@ -4254,6 +4270,7 @@ async function handleResponses(request, response, requestUrl) {
         agingEnabled,
       });
       toolResultAging = built.toolResultAging;
+      conversationWindow = built.conversationWindow;
       agedInput = built.agedInput;
       namespacesFlattened = built.namespacesFlattened;
       flattenedNamespaces = built.flattenedNamespaces;
@@ -4359,8 +4376,13 @@ async function handleResponses(request, response, requestUrl) {
           const aged = ageToolResults(native.input, {
             enabled: nativeToolResultAgingEnabled(),
           });
-          native.input = aged.input;
+          const windowed = windowConversation(aged.input, {
+            enabled: conversationWindowEnabled(),
+            tailBytes: conversationWindowTailBytes(),
+          });
+          native.input = windowed.input;
           toolResultAging = aged.stats;
+          conversationWindow = windowed.stats;
         }
       }
       // SF and other native multi-agent parents hit this path (model_provider
@@ -5056,6 +5078,7 @@ async function handleResponses(request, response, requestUrl) {
       ...usage,
       estimatedInputTokens,
       ...toolResultAging,
+      ...conversationWindow,
       retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
       ...(emptyCompletion ? { emptyCompletion: true } : {}),
       ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
@@ -5220,6 +5243,7 @@ async function handleResponses(request, response, requestUrl) {
         ...usage,
         estimatedInputTokens,
         ...toolResultAging,
+        ...conversationWindow,
         ...(emptyCompletion ? { emptyCompletion: true } : {}),
         ...(emptyCompletionPreludeLimit
           ? { emptyCompletionPreludeLimit }
@@ -5260,6 +5284,7 @@ async function handleResponses(request, response, requestUrl) {
           ...usage,
           estimatedInputTokens,
           ...toolResultAging,
+          ...conversationWindow,
           retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
         }, diagnostics);
         usageRecorded = true;
@@ -5295,6 +5320,7 @@ async function handleResponses(request, response, requestUrl) {
           ...usage,
           estimatedInputTokens,
           ...toolResultAging,
+          ...conversationWindow,
           ...(emptyCompletion ? { emptyCompletion: true } : {}),
           ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
         }, diagnostics);
@@ -5321,6 +5347,7 @@ async function handleResponses(request, response, requestUrl) {
         ...usage,
         estimatedInputTokens,
         ...toolResultAging,
+        ...conversationWindow,
         ...(response.headersSent ? { streamAborted: true } : {}),
         ...(emptyCompletion ? { emptyCompletion: true } : {}),
         ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),

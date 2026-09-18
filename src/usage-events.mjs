@@ -158,6 +158,20 @@ export function recordUsageEvent({
   // two: compare it against the eligibility floor.
   toolResultsEvaluated,
   toolResultBytesLargest,
+  // Present whenever the conversation-window pass ran, even when it changed
+  // nothing. A routed or native turn leaves as a full conversation replay, so
+  // this is what proves the already-consumed middle was dropped before the
+  // request was billed. `BytesSaved` is the measured difference between the
+  // replayed conversation and what was actually sent.
+  conversationWindowRan,
+  conversationWindowBytesBefore,
+  conversationWindowBytesAfter,
+  conversationWindowBytesSaved,
+  conversationWindowItemsDropped,
+  conversationWindowTailItems,
+  conversationWindowFrontierIndex,
+  conversationWindowLatestUserIndex,
+  conversationWindowTailBytes,
   // Present only on a turn the router moved to another model because the one
   // the operator asked for reported it had no usage left. `model` and
   // `provider` above name what actually served the turn; this names what was
@@ -275,6 +289,31 @@ export function recordUsageEvent({
       : {}),
     ...(safeTokenCount(toolResultBytesLargest) !== undefined
       ? { toolResultBytesLargest: safeTokenCount(toolResultBytesLargest) }
+      : {}),
+    // Written whenever the pass ran, zeros included: a zero `BytesSaved` with
+    // a non-zero `TailItems` is the proof that the pass looked and the
+    // conversation already fit. A disabled pass writes nothing, so "off" never
+    // reads as "on and found nothing to drop".
+    ...(conversationWindowRan === true
+      ? {
+          conversationWindowRan: true,
+          conversationWindowBytesBefore:
+            safeTokenCount(conversationWindowBytesBefore) ?? 0,
+          conversationWindowBytesAfter:
+            safeTokenCount(conversationWindowBytesAfter) ?? 0,
+          conversationWindowBytesSaved:
+            safeTokenCount(conversationWindowBytesSaved) ?? 0,
+          conversationWindowItemsDropped:
+            safeTokenCount(conversationWindowItemsDropped) ?? 0,
+          conversationWindowTailItems:
+            safeTokenCount(conversationWindowTailItems) ?? 0,
+          conversationWindowFrontierIndex:
+            safeTokenCount(conversationWindowFrontierIndex) ?? 0,
+          conversationWindowLatestUserIndex:
+            safeTokenCount(conversationWindowLatestUserIndex) ?? -1,
+          conversationWindowTailBytes:
+            safeTokenCount(conversationWindowTailBytes) ?? 0,
+        }
       : {}),
     ...diagnostics,
   };

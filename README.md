@@ -1275,6 +1275,39 @@ authoritative cost measurement.
 For a reproducible provider-reported A/B, see
 [`docs/tool-result-aging-benchmark.md`](docs/tool-result-aging-benchmark.md).
 
+**Conversation window.** Routed turns leave this router as a stateless full
+conversation: no upstream provider keeps the thread, because
+`previous_response_id` is stripped before the request leaves. The client
+therefore replays every earlier item on every turn, which is why a request whose
+actual question is a few hundred bytes can still bill hundreds of thousands of
+input tokens. The window pass sends only what the current turn needs — system
+and developer instructions, the carriers of already-compacted history, the
+newest 64 KiB of the conversation, and the current user turn. The consumed
+middle is dropped, never summarized.
+
+What survives is byte-for-byte identical to what the client sent, and the cut is
+deterministic, so the pinned instruction head keeps matching the provider's
+prompt cache across turns instead of being invalidated every time. The frontier
+is pulled back onto safe boundaries: a tool call is never separated from its
+result, and a reasoning item is never split from the turn that produced it.
+
+The current turn is never truncated, however large it is: the frontier stops at
+the newest user message, so a turn whose own tool output exhausts the budget
+still reaches the model whole. Tune the budget with
+`CODEX_ROUTER_CONVERSATION_WINDOW_KB` (kilobytes; `0` keeps only the
+instructions, the compaction carriers, and the current turn).
+
+This pass is separate from tool-result aging and never lowers a compaction
+threshold: Codex, DeepSeek Harness, and Gemini CLI still decide when the whole
+conversation needs compaction, and the catalog keeps the thresholds it ships
+with. The window only shrinks what is replayed between those compaction points,
+so it is **on by default** — an older turn that has already been consumed cannot
+change the answer to the current one. Set `CODEX_ROUTER_CONVERSATION_WINDOW=0`
+in the service environment to turn it off. The value is read per request, so no
+catalog edit is needed. Routed turns that used it report
+`conversationWindowBytesSaved`, `conversationWindowItemsDropped`, and
+`conversationWindowTailItems` in `usage-events.jsonl`.
+
 The integration preserves the built-in OpenAI provider, native GPT models,
 ChatGPT sign-in, profiles, MCP settings, project trust, and reasoning defaults.
 It adds one marked root block and one inert custom-provider table to the user's
