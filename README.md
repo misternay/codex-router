@@ -1282,7 +1282,7 @@ therefore replays every earlier item on every turn, which is why a request whose
 actual question is a few hundred bytes can still bill hundreds of thousands of
 input tokens. The window pass sends only what the current turn needs — system
 and developer instructions, the carriers of already-compacted history, the
-newest 64 KiB of the conversation, and the current user turn. The consumed
+newest 64 KiB of the conversation, and the request being answered. The consumed
 middle is dropped, never summarized.
 
 What survives is byte-for-byte identical to what the client sent, and the cut is
@@ -1291,11 +1291,15 @@ prompt cache across turns instead of being invalidated every time. The frontier
 is pulled back onto safe boundaries: a tool call is never separated from its
 result, and a reasoning item is never split from the turn that produced it.
 
-The current turn is never truncated, however large it is: the frontier stops at
-the newest user message, so a turn whose own tool output exhausts the budget
-still reaches the model whole. Tune the budget with
-`CODEX_ROUTER_CONVERSATION_WINDOW_KB` (kilobytes; `0` keeps only the
-instructions, the compaction carriers, and the current turn).
+The newest user request is pinned, so the model always reads the turn it is
+answering, but that turn's own tool traffic is not. A long agentic turn used to
+replay every one of its tool results on each following step — a single 1.4 MB
+turn cost its full size on every tool call — so the frontier now advances past
+the request and keeps the newest 64 KiB of the turn byte-for-byte. The loop
+resumes from its most recent step instead of re-reading everything it already
+acted on. Tune the budget with `CODEX_ROUTER_CONVERSATION_WINDOW_KB`
+(kilobytes; `0` keeps only the instructions, the compaction carriers, and the
+request).
 
 This pass is separate from tool-result aging and never lowers a compaction
 threshold: Codex, DeepSeek Harness, and Gemini CLI still decide when the whole

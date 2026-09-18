@@ -64,7 +64,7 @@ test("keeps a conversation that already fits the budget byte-for-byte", () => {
   assert.equal(result.stats.conversationWindowTailBytes, CONVERSATION_WINDOW_TAIL_BYTES);
 });
 
-test("drops the consumed middle while keeping instructions and the current turn", () => {
+test("drops the consumed middle while keeping instructions and the newest request", () => {
   const input = longConversation();
   input.push(message("user", "now finish the job"));
 
@@ -154,7 +154,7 @@ test("drops an old compaction carrier only when it is not a carrier", () => {
   assert.equal(result.input.includes(ordinary), false);
 });
 
-test("never truncates the current turn even when it alone exhausts the budget", () => {
+test("a request larger than the whole budget still reaches the model in full", () => {
   const current = message("user", `read this ${"v".repeat(40_000)}`);
   const input = [...longConversation(), current];
 
@@ -163,6 +163,49 @@ test("never truncates the current turn even when it alone exhausts the budget", 
   // The oversized request survives in full; only older turns give way.
   assert.equal(result.input.includes(current), true);
   assert.ok(result.stats.conversationWindowBytesAfter >= bytesOf(current));
+});
+
+test("keeps the current request while dropping the tool traffic it already consumed", () => {
+  const request = message("user", "audit the repository");
+  const input = [message("system", "rules"), request];
+  for (let index = 0; index < 10; index += 1) {
+    input.push(call(`step-${index}`));
+    input.push(output(`step-${index}`, "y".repeat(8_000)));
+  }
+  input.push(call("latest"));
+  input.push(output("latest", "small"));
+
+  const result = windowConversation(input, FORCED);
+  // The request that opened the turn still reaches the model...
+  assert.equal(result.input.includes(request), true);
+  assert.deepEqual(result.input[0], input[0]);
+  // ...while the middle of its own tool traffic is dropped, and the newest step
+  // with its result survives so the loop can continue from it.
+  assert.equal(result.input.includes(input[2]), false);
+  assert.ok(result.stats.conversationWindowBytesSaved > 0);
+  assert.deepEqual(result.input.slice(-2), [call("latest"), output("latest", "small")]);
+});
+
+test("the newest request is pinned even when the tail budget cannot reach it", () => {
+  const request = message("user", "keep going");
+  const input = [message("system", "rules"), request];
+  for (let index = 0; index < 30; index += 1) {
+    input.push(call(`step-${index}`));
+    input.push(output(`step-${index}`, "z".repeat(6_000)));
+  }
+
+  const result = windowConversation(input, FORCED);
+  assert.equal(result.input.includes(request), true);
+  assert.ok(result.input.length < input.length);
+  // Dropping the middle never leaves a tool result without its call.
+  const callIds = new Set(
+    result.input.filter((item) => item.type === "function_call").map((item) => item.call_id),
+  );
+  const outputs = result.input.filter((item) => item.type === "function_call_output");
+  assert.ok(outputs.length > 0);
+  for (const item of outputs) {
+    assert.ok(callIds.has(item.call_id), `dangling tool result ${item.call_id}`);
+  }
 });
 
 test("the rewrite is deterministic so an unchanged prefix keeps its cache match", () => {
@@ -191,7 +234,7 @@ test("the ran marker is true whenever the pass is enabled and reads input", () =
   assert.equal(untouched.stats.conversationWindowRan, true);
 });
 
-test("a zero tail keeps only pinned items and the current turn", () => {
+test("a zero tail keeps only pinned items and the request", () => {
   const input = [...longConversation(), message("user", "continue")];
   const result = windowConversation(input, { enabled: true, tailBytes: 0 });
   assert.equal(result.input.length, 2);
