@@ -40,6 +40,7 @@ const PACK = [
   "codex-app-threads",
   "codex-in-app-browser",
   "codex-computer-use",
+  "jev-browser-choice",
 ];
 const SKILL_FRONTMATTER = /^---\r?\nname: (.+)\r?\ndescription: (.+)\r?\n---\r?\n/;
 const SKILLS_MODULE_URL = new URL("../src/skills-install.mjs", import.meta.url).href;

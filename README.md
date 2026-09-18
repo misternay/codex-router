@@ -2204,6 +2204,9 @@ correctly, so the installer adds a small skill pack to `~/.codex/skills/`:
 - `codex-in-app-browser` — driving the in-app browser through
   `mcp__node_repl__js`.
 - `codex-computer-use` — driving local apps through the `@oai/sky` runtime.
+- `jev-browser-choice` — routing the next in-app-browser click through Jev:
+  the accessibility dump goes to the model, one validated element index comes
+  back, and the page never enters context.
 
 The skills live in `skills/` in this repository. `bin/install` copies them
 to `~/.codex/skills/` (each directory is marked `.codex-router-managed`);

@@ -13,6 +13,7 @@ export const PACK_SKILLS = [
   "codex-app-threads",
   "codex-in-app-browser",
   "codex-computer-use",
+  "jev-browser-choice",
 ];
 
 export function latestRollout(sessionsRoot) {
