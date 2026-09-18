@@ -340,9 +340,9 @@ function coalesceAssistantMessages(messages) {
   return coalesced;
 }
 
-function restoreNativeReasoningContent(messages) {
+function restoreNativeReasoningContent(messages, { hasTools = false } = {}) {
   if (!Array.isArray(messages)) return messages;
-  return messages.map((message) => {
+  const restored = messages.map((message) => {
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
     const reasoning = [];
     const visible = [];
@@ -376,6 +376,37 @@ function restoreNativeReasoningContent(messages) {
       restored.reasoning_content = reasoning.join("\n");
     }
     return restored;
+  });
+  return hasTools ? fillUnreplayedReasoning(restored) : restored;
+}
+
+// DeepSeek states the rule itself: once a request carries `tools`, the chain of
+// thought of every previous turn is expected back, and a history that omits it
+// -- from one turn or from all of them -- is answered with HTTP 400 "The
+// `reasoning_content` in the thinking mode must be passed back to the API".
+// Codex stores a native turn's reasoning as ciphertext plus a summary, and the
+// summary is empty whenever the provider had none to give, so handing a native
+// session to a Chat thinking route -- the Codex-dry tandem, or a manual switch
+// after native turns -- replays turns the vendor has no chain of thought for.
+// Measured end to end on a captured 155-item native history against opencode
+// Go on 18 September 2026: the request 400s as captured, 200 with the
+// empty-summary turn filled in, and 400 again with every summary emptied --
+// so the short tool loops that answer 200 without any reasoning are not the
+// rule, the tool-bearing history is.
+//
+// Every assistant turn that calls a tool therefore carries one. The stub is
+// labelled, because it is concatenated into the model's context as its own
+// past thinking; the alternative is losing the turn. History without tools is
+// left alone: the vendor ignores reasoning there, and nothing asks for it.
+const UNREPLAYED_REASONING =
+  "[reasoning unavailable: this turn's thinking was recorded without a plaintext replay]";
+
+function fillUnreplayedReasoning(messages) {
+  return messages.map((message) => {
+    if (message?.role !== "assistant") return message;
+    if (!Array.isArray(message.tool_calls) || !message.tool_calls.length) return message;
+    if (typeof message.reasoning_content === "string" && message.reasoning_content) return message;
+    return { ...message, reasoning_content: UNREPLAYED_REASONING };
   });
 }
 
@@ -1115,7 +1146,12 @@ function normalizeBody(buffer, contentType, route) {
   if (Array.isArray(payload.messages)) {
     payload.messages = sanitizeChatToolHistory(payload.messages, provider, model);
     if (usesNativeChatReasoning(model)) {
-      payload.messages = restoreNativeReasoningContent(payload.messages);
+      payload.messages = restoreNativeReasoningContent(payload.messages, {
+        // The vendor asks for the replay only while the request carries tools
+        // (`deepseek-thinking` profiles forbid them one at a time, DeepSeek's
+        // guide states the rule); without them it ignores the field entirely.
+        hasTools: Array.isArray(payload.tools) && payload.tools.length > 0,
+      });
     }
   }
   if (provider.authProfile === "github-copilot") {

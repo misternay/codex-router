@@ -165,6 +165,14 @@ test("pinned LiteLLM replays Chat reasoning exactly once", { skip: !python, time
     { type: "reasoning", content: [{ type: "reasoning_text", text: "TOOL_REASONING_TWO" }] },
     { type: "function_call", name: "probe", call_id: "call_fixture", arguments: "{}" },
     { type: "function_call_output", call_id: "call_fixture", output: "fixture result" },
+    // A native turn whose summary is empty, which is what Codex stores whenever
+    // the provider had none to give. It replays as a tool turn with no
+    // reasoning at all, and a history that carries reasoning on only some of
+    // its turns is the shape DeepSeek answers with its "reasoning_content in
+    // the thinking mode must be passed back" 400.
+    { type: "reasoning", summary: [], content: null },
+    { type: "function_call", name: "probe", call_id: "call_unreplayed", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_unreplayed", output: "fixture result" },
     { type: "reasoning", content: [{ type: "reasoning_text", text: "ANSWER_REASONING" }] },
     { type: "message", role: "assistant", content: [{ type: "output_text", text: "FINAL_VISIBLE" }] },
     { type: "message", role: "user", content: "Continue the synthetic check." },
@@ -183,6 +191,11 @@ test("pinned LiteLLM replays Chat reasoning exactly once", { skip: !python, time
     }
     const toolTurn = messages.find((message) => message.tool_calls?.[0]?.id === "call_fixture");
     assert.equal(toolTurn.reasoning_content, "TOOL_REASONING_ONE\nTOOL_REASONING_TWO");
+    // Every tool turn of a history that replays reasoning somewhere has to
+    // carry it, even when the source turn had none to give.
+    const unreplayedTurn = messages.find((message) => message.tool_calls?.[0]?.id === "call_unreplayed");
+    assert.ok(unreplayedTurn.reasoning_content, "a tool turn with no recorded reasoning must still replay one");
+    assert.notEqual(unreplayedTurn.reasoning_content, toolTurn.reasoning_content);
   }
 
   try {

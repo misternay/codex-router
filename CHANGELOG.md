@@ -1,6 +1,27 @@
 # Changelog
 
 ## Unreleased
+- **A native session handed to a Chat thinking route no longer 400s on the
+  reasoning the vendor never got.** DeepSeek's thinking mode expects the chain
+  of thought of every previous turn as soon as a request carries `tools`, and
+  it answers a history that omits any of it with HTTP 400 "The
+  `reasoning_content` in the thinking mode must be passed back to the API"
+  (#48180 reports the same shape on opencode Go). Codex stores a native turn's
+  reasoning as ciphertext plus a summary, and the summary is empty whenever the
+  provider had none to give, so the Codex-dry tandem -- or a manual switch to a
+  Chat thinking route after native turns -- replayed turns the vendor had no
+  chain of thought for and lost the call (`jev-router-live.jsonl`, 18 September
+  2026: `codex_dry(retry):gpt-5.6-sol` →
+  `opencode-go/deepseek-v4.1-flash`, status 400). Every assistant turn that
+  calls a tool now carries one: the summary the caller sent when there is one,
+  and an explicitly labelled stub when the source turn had none, because that
+  text is concatenated into the model's context as its own past thinking and
+  the alternative is losing the turn. Nothing is added to a request that
+  carries no tools, where the vendor ignores the field. Reproduced and bisected
+  against the captured 155-item native history: 400 as captured, 200 with the
+  one empty-summary turn filled, and 400 again with every summary emptied --
+  so the short tool loops that answer 200 with no reasoning at all are not the
+  rule, the tool-bearing history is.
 - **The Devin CLI model list asks for the method Devin 3000.x actually serves.**
   `devin-cli` called `GetCascadeModelConfigs`, which is the IDE's method; the
   CLI moved to `GetCliModelConfigs`, so a CLI-credentialed account was answered
