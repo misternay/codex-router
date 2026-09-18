@@ -27,8 +27,57 @@ const AX = [
 ].join("\n");
 
 function fakeTab(ax = AX) {
-  return { ax: { get: async () => ax } };
+  const reads = [];
+  return {
+    reads,
+    ax: {
+      get: async (mode, options) => {
+        reads.push({ mode, options });
+        return ax;
+      },
+    },
+  };
 }
+
+// Lines captured verbatim from the in-app browser's accessibility dump: roles
+// are phrases, and state markers sit between the role and the accessible name.
+const IN_APP_AX = [
+  'Browser tab: 1, Title: "Wikipedia, the free encyclopedia", URL: "https://en.wikipedia.org/wiki/Main_Page".',
+  "\t1 AXWebArea Wikipedia, the free encyclopedia, URL: en.wikipedia.org/wi…",
+  "\t\t5 pop up button Description: Main menu, ID: vector-main-menu-dropdown-checkbox",
+  "\t\t\t8 search text field (settable) Description: Search Wikipedia, Help: Search Wikipedia [ctrl-option-f], ID: searchInput",
+  "\t\t\t9 button Search",
+  "\t\t\t\t12 link Description: Donate, Value: donate.wikimedia.org",
+  "\t\t\t\t13 radio button (settable, integer) Description: Small",
+  "\t\t\t\t14 heading Welcome to Wikipedia,",
+  "",
+  "The focused UI element is 1 AXWebArea Wikipedia, the free encyclopedia, URL: en.wikipedia.org/wi…",
+].join("\n");
+
+test("parseAx reads the in-app runtime's phrase roles and state markers", () => {
+  const { page, candidates } = parseAx(IN_APP_AX);
+  assert.equal(page.url, "https://en.wikipedia.org/wiki/Main_Page");
+  assert.deepEqual(
+    candidates.map((candidate) => [candidate.id, candidate.role, candidate.label]),
+    [
+      ["e5", "combobox", "Main menu"],
+      ["e8", "searchbox", "Search Wikipedia"],
+      ["e9", "button", "Search"],
+      ["e12", "link", "Donate · value: donate.wikimedia.org"],
+      ["e13", "radio", "Small"],
+    ],
+  );
+});
+
+test("chooseElement reads a full snapshot instead of a runtime diff", async () => {
+  const tab = fakeTab(
+    'Browser tab: 1, Title: "t", URL: "https://example.test/".\nThere has been no change in the accessibility tree.',
+  );
+  const decision = await chooseElement(tab, { goal: "Do something" });
+  assert.equal(decision.status, "abstain");
+  assert.equal(decision.reason, "no-actionable-elements");
+  assert.deepEqual(tab.reads, [{ mode: "state", options: { disableDiffing: true } }]);
+});
 
 function fakeFetch(payload, { status = 200 } = {}) {
   const calls = [];
@@ -125,6 +174,7 @@ test("chooseElement returns the offered element Jev picked", async () => {
   assert.equal(fetchImpl.calls[0].headers.authorization, "Bearer test-key");
   assert.equal(JSON.stringify(decision).includes("test-key"), false);
   const sent = fetchImpl.calls[0].body;
+  assert.equal(sent.model, "jev-latest");
   assert.equal(sent.questions.next.type, "choice");
   assert.equal(sent.state.elements.length, 6);
   assert.match(sent.questions.next.instructions, /untrusted data/);

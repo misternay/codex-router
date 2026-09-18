@@ -40,12 +40,45 @@ const DEFAULTS = {
   timeoutMs: 20_000,
   apiUrl: DEFAULT_API_URL,
   keyFiles: DEFAULT_KEY_FILES,
+  // TypeSafe requires an explicit model on every request.
+  model: globalThis.process?.env?.TYPESAFE_MODEL || "jev-latest",
 };
 
-const ELEMENT_LINE = /^(\t*)(\d+)\s+([A-Za-z][A-Za-z0-9_-]*)\s*(.*)$/;
+const ELEMENT_LINE = /^(\t*)(\d+)\s+(.*)$/;
 const ATTRIBUTE = /,\s*([A-Z][A-Za-z ]{1,24}):\s*/g;
 const LEADING_LABEL = /^(description|title|name):\s*/i;
+const LEADING_MARKERS = /^(?:\([^)]*\)\s*)+/;
 const HEADER = /^Browser tab:.*?Title:\s*"?(.*?)"?,?\s+URL:\s*"?(.*?)"?\.?$/;
+
+/**
+ * The runtime writes roles as phrases, not single ARIA tokens, and its
+ * vocabulary is wider than ARIA's. Longest phrase first: "search text field" is
+ * one control, not a "search" control whose name starts with "text field".
+ */
+const ROLE_PHRASES = [
+  ["menu item checkbox", "menuitemcheckbox"],
+  ["menu item radio", "menuitemradio"],
+  ["search text field", "searchbox"],
+  ["text field", "textbox"],
+  ["pop up button", "combobox"],
+  ["radio button", "radio"],
+  ["check box", "checkbox"],
+  ["toggle button", "button"],
+  ["menu item", "menuitem"],
+  ["list box", "combobox"],
+];
+
+/** Split one element line into its role and the rest, markers left in place. */
+function splitRole(text) {
+  for (const [phrase, role] of ROLE_PHRASES) {
+    if (!text.toLowerCase().startsWith(phrase)) continue;
+    const after = text.slice(phrase.length);
+    if (after === "" || /^[\s(,.]/.test(after)) return { role, rest: after };
+  }
+  const single = /^([A-Za-z][A-Za-z0-9_-]*)(.*)$/s.exec(text);
+  if (!single) return null;
+  return { role: single[1].toLowerCase(), rest: single[2] };
+}
 
 function truncate(text, limit) {
   const value = String(text ?? "").replace(/\s+/g, " ").trim();
@@ -99,17 +132,19 @@ export function parseAx(axText, options = {}) {
     const match = ELEMENT_LINE.exec(line);
     if (!match) continue;
     const index = Number(match[2]);
-    const role = match[3].toLowerCase();
+    const split = splitRole(match[3]);
+    if (!split) continue;
+    const role = split.role;
     if (!roles.has(role) || seen.has(index)) continue;
     actionable += 1;
     if (candidates.length >= limit) continue;
     seen.add(index);
-    const { name, attributes } = splitAttributes(match[4]);
+    const { name, attributes } = splitAttributes(split.rest.trimStart().replace(LEADING_MARKERS, ""));
     const label = [attributes.description ?? name, attributes.value ? `value: ${attributes.value}` : ""]
       .filter(Boolean)
       .join(" · ");
     const candidate = { id: `e${index}`, index, role, label: truncate(label, labelChars) };
-    if (/\bdisabled\b/i.test(match[4])) candidate.disabled = true;
+    if (/\bdisabled\b/i.test(split.rest)) candidate.disabled = true;
     candidates.push(candidate);
   }
   return {
@@ -202,7 +237,7 @@ export async function readApiKey({ keyFiles = DEFAULT_KEY_FILES } = {}) {
  * /ask surface instead. The key is never echoed, including in thrown errors.
  */
 export async function askJev({ state, questions }, options = {}) {
-  const { apiUrl, askUrl, apiKey, keyFiles, timeoutMs, fetch: fetchImpl } = {
+  const { apiUrl, askUrl, apiKey, keyFiles, timeoutMs, model, fetch: fetchImpl } = {
     ...DEFAULTS,
     ...options,
   };
@@ -225,7 +260,7 @@ export async function askJev({ state, questions }, options = {}) {
     const response = await doFetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ state, questions }),
+      body: JSON.stringify({ model, state, questions }),
       signal: controller.signal,
     });
     const text = await response.text();
@@ -251,7 +286,9 @@ export async function chooseElement(tab, { goal, history = [], ...options } = {}
   const config = { ...DEFAULTS, ...options };
   const started = Date.now();
   if (!goal || !String(goal).trim()) throw new Error("a goal is required");
-  const axText = await tab.ax.get("state");
+  // The in-app runtime diffs the tree, so a repeat read returns "there has been
+  // no change" and no elements at all. Always ask for the full snapshot.
+  const axText = await tab.ax.get("state", { disableDiffing: true });
   const { page, candidates, actionable, truncatedElements } = parseAx(axText, config);
   const base = { page, candidates: candidates.length, actionable, truncatedElements };
   if (candidates.length === 0) {
