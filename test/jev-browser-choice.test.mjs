@@ -69,6 +69,24 @@ test("parseAx reads the in-app runtime's phrase roles and state markers", () => 
   );
 });
 
+test("parseAx resolves role spellings that differ only by spacing", () => {
+  // X exposes its search field as "combo box"; a table of exact phrases misses it.
+  const ax = [
+    'Browser tab: 3, Title: "Explorer / X", URL: "https://x.com/explore".',
+    "\t41 container Chercher",
+    "\t43 combo box (settable) Requête de recherche",
+    "\t44 button Rechercher",
+  ].join("\n");
+  const { candidates } = parseAx(ax);
+  assert.deepEqual(
+    candidates.map((candidate) => [candidate.id, candidate.role, candidate.label]),
+    [
+      ["e43", "combobox", "Requête de recherche"],
+      ["e44", "button", "Rechercher"],
+    ],
+  );
+});
+
 test("chooseElement reads a full snapshot instead of a runtime diff", async () => {
   const tab = fakeTab(
     'Browser tab: 1, Title: "t", URL: "https://example.test/".\nThere has been no change in the accessibility tree.',

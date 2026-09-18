@@ -68,16 +68,28 @@ const ROLE_PHRASES = [
   ["list box", "combobox"],
 ];
 
-/** Split one element line into its role and the rest, markers left in place. */
-function splitRole(text) {
+/**
+ * Split one element line into its role and the rest, markers left in place.
+ * The phrase table covers roles the runtime names differently from ARIA
+ * ("text field" is a textbox, "pop up button" is a combobox); the fallback
+ * matches a de-spaced prefix against the offered roles, so spelling variants
+ * like "combo box" and "check box" resolve without another table entry.
+ */
+function splitRole(text, roles) {
   for (const [phrase, role] of ROLE_PHRASES) {
     if (!text.toLowerCase().startsWith(phrase)) continue;
     const after = text.slice(phrase.length);
     if (after === "" || /^[\s(,.]/.test(after)) return { role, rest: after };
   }
-  const single = /^([A-Za-z][A-Za-z0-9_-]*)(.*)$/s.exec(text);
-  if (!single) return null;
-  return { role: single[1].toLowerCase(), rest: single[2] };
+  const words = text.split(/\s+/);
+  for (let count = Math.min(3, words.length); count >= 1; count -= 1) {
+    const phrase = words.slice(0, count).join(" ");
+    const canonical = phrase.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!roles.has(canonical)) continue;
+    const after = text.slice(phrase.length);
+    if (after === "" || /^[\s(,.]/.test(after)) return { role: canonical, rest: after };
+  }
+  return null;
 }
 
 function truncate(text, limit) {
@@ -132,7 +144,7 @@ export function parseAx(axText, options = {}) {
     const match = ELEMENT_LINE.exec(line);
     if (!match) continue;
     const index = Number(match[2]);
-    const split = splitRole(match[3]);
+    const split = splitRole(match[3], roles);
     if (!split) continue;
     const role = split.role;
     if (!roles.has(role) || seen.has(index)) continue;
