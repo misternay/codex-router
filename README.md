@@ -1288,8 +1288,10 @@ middle is dropped, never summarized.
 What survives is byte-for-byte identical to what the client sent, and the cut is
 deterministic, so the pinned instruction head keeps matching the provider's
 prompt cache across turns instead of being invalidated every time. The frontier
-is pulled back onto safe boundaries: a tool call is never separated from its
-result, and a reasoning item is never split from the turn that produced it.
+is pulled back onto safe boundaries: retained tool results keep their matching
+calls, including native tool-search discoveries and out-of-order parallel
+results. Dependencies pulled in by that widening are checked too. A reasoning
+item is never split from the turn that produced it.
 
 The newest user request is pinned, so the model always reads the turn it is
 answering, but that turn's own tool traffic is not. A long agentic turn used to

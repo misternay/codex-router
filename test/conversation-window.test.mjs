@@ -119,6 +119,79 @@ test("never keeps a tool result whose call was dropped", () => {
   }
 });
 
+test("keeps the native tool-search call when its discovery output crosses the cut", () => {
+  const searchCall = {
+    type: "tool_search_call",
+    execution: "client",
+    status: "completed",
+    call_id: "search-1",
+    arguments: { query: "find a tool" },
+  };
+  const searchOutput = {
+    type: "tool_search_output",
+    execution: "client",
+    status: "completed",
+    call_id: "search-1",
+    tools: [{ type: "function", name: "discovered", parameters: { type: "object" } }],
+  };
+  const input = [...longConversation(), searchCall, searchOutput, message("user", "continue")];
+  const snapshot = structuredClone(input);
+  const result = windowConversation(input, {
+    tailBytes: bytesOf(searchOutput) + bytesOf(input.at(-1)),
+    boundarySlackItems: 0,
+  });
+  assert.deepEqual(result.input.slice(-3), [searchCall, searchOutput, input.at(-1)]);
+  assert.ok(result.stats.conversationWindowItemsDropped > 0);
+  assert.deepEqual(input, snapshot);
+});
+
+test("all retained parallel results keep their calls even after a non-result frontier", () => {
+  const first = call("first");
+  const second = call("second");
+  const boundary = message("assistant", "Both tools are running.");
+  const results = [output("second", "two"), output("first", "one")];
+  const gap = message("assistant", "Waiting.");
+  const input = [...longConversation(), first, second, gap, boundary, ...results];
+  const result = windowConversation(input, {
+    tailBytes: bytesOf(boundary) + results.reduce((sum, item) => sum + bytesOf(item), 0),
+    boundarySlackItems: 0,
+  });
+  assert.deepEqual(result.input.slice(-6), [first, second, gap, boundary, ...results]);
+});
+
+test("widening the frontier closes dependencies newly pulled into the retained tail", () => {
+  const a = call("a");
+  const b = call("b");
+  const c = call("c");
+  const tail = [a, b, output("b", "b"), c, output("a", "a"), output("c", "c")];
+  const input = [...longConversation(), ...tail];
+  const result = windowConversation(input, {
+    tailBytes: bytesOf(tail.at(-1)),
+    boundarySlackItems: 0,
+  });
+  assert.deepEqual(result.input.slice(-tail.length), tail);
+});
+
+test("dependency matching uses the call type and id, never a later or unrelated call", () => {
+  const originalOrphan = {
+    type: "tool_search_output", execution: "client", status: "completed",
+    call_id: "shared", tools: [],
+  };
+  const laterSearch = {
+    type: "tool_search_call", execution: "client", status: "completed",
+    call_id: "shared", arguments: { query: "later" },
+  };
+  const unrelated = call("shared");
+  const tail = [originalOrphan, laterSearch, message("user", "continue")];
+  const input = [...longConversation(), unrelated, message("assistant", "gap"), ...tail];
+  const result = windowConversation(input, {
+    tailBytes: tail.reduce((sum, item) => sum + bytesOf(item), 0),
+    boundarySlackItems: 0,
+  });
+  assert.equal(result.input.includes(unrelated), false);
+  assert.deepEqual(result.input.slice(-tail.length), tail);
+});
+
 test("never begins the kept region on a reasoning item", () => {
   const input = [message("system", "rules")];
   for (let index = 0; index < 8; index += 1) {

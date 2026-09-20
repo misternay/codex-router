@@ -9080,6 +9080,72 @@ test("a long routed conversation is replayed as a window instead of in full", as
   }
 });
 
+test("native and Responses routes keep tool-search pairs across the conversation window", async () => {
+  const forwarded = [];
+  const upstream = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    forwarded.push(body);
+    const calls = new Set(body.input
+      .filter((item) => item.type === "tool_search_call")
+      .map((item) => item.call_id));
+    const orphan = body.input.find((item) =>
+      item.type === "tool_search_output" && !calls.has(item.call_id));
+    json(response, orphan ? 400 : 200, orphan
+      ? { error: { message: `No tool call found for tool search output with call_id ${orphan.call_id}.` } }
+      : { output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-window-search-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    CODEX_ROUTER_CONVERSATION_WINDOW: "1",
+    CODEX_ROUTER_CONVERSATION_WINDOW_KB: "64",
+    CODEX_ROUTER_QUIET: "1",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  });
+  const search = {
+    type: "tool_search_call", execution: "client", status: "completed",
+    call_id: "window-search", arguments: { query: "a tool" },
+  };
+  const discovery = {
+    type: "tool_search_output", execution: "client", status: "completed",
+    call_id: search.call_id,
+    tools: [{ type: "function", name: "discovered", parameters: { type: "object" } }],
+  };
+  const input = [
+    { type: "message", role: "system", content: "Operator rules." },
+    { type: "message", role: "assistant", content: "old".repeat(40_000) },
+    search, discovery,
+    ...Array.from({ length: 3 }, () => ({
+      type: "message", role: "assistant", content: "Progress.",
+    })),
+    // The byte cut lands here; the default four-item slack lands on discovery.
+    { type: "message", role: "user", content: "u".repeat(66_000) },
+  ];
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const model of ["gpt-5.6-sol", "meta/muse-spark-1.2"]) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+        body: JSON.stringify({ model, stream: false, input }),
+      });
+      assert.equal(response.status, 200, await response.text());
+      const kept = forwarded.at(-1).input;
+      assert.deepEqual(kept.filter((item) => item.call_id === search.call_id), [search, discovery]);
+      assert.equal(kept.some((item) => item.content === input[1].content), false);
+    }
+    const events = await waitForUsageEvents(stateDir, 2, router);
+    assert.equal(events.every((event) => event.conversationWindowItemsDropped > 0), true);
+  } finally {
+    await stopChild(router);
+    await closeServer(upstream.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("RTK shaping is reserved for routed compaction and ordinary turns keep newest results exact", async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {

@@ -31,12 +31,13 @@ export const CONVERSATION_WINDOW_TAIL_BYTES = 64 * 1024;
 export const CONVERSATION_WINDOW_MIN_TOTAL_BYTES = 0;
 export const CONVERSATION_WINDOW_BOUNDARY_SLACK_ITEMS = 4;
 
-const OUTPUT_TYPES = new Set(["function_call_output", "custom_tool_call_output"]);
-const CALL_TYPES = new Set([
-  "function_call",
-  "custom_tool_call",
-  "local_shell_call",
+const OUTPUT_CALL_TYPES = new Map([
+  ["function_call_output", "function_call"],
+  ["custom_tool_call_output", "custom_tool_call"],
+  ["local_shell_call_output", "local_shell_call"],
+  ["tool_search_output", "tool_search_call"],
 ]);
+const CALL_TYPES = new Set(OUTPUT_CALL_TYPES.values());
 const REASONING_TYPES = new Set(["reasoning"]);
 const INSTRUCTION_ROLES = new Set(["system", "developer"]);
 const COMPACTION_TYPES = new Set(["compaction", "compaction_trigger"]);
@@ -146,15 +147,31 @@ function findFrontier(input, sizes, tailBytes, boundarySlackItems) {
   // the frontier stays at the end, so an operator who asks for "the request
   // only" gets exactly the pinned items instead of a few extra ones.
   if (tail > 0) frontier = Math.max(0, frontier - boundarySlackItems);
-  // Never begin the kept region in the middle of a call/result pair.
-  if (frontier > 0 && OUTPUT_TYPES.has(input[frontier]?.type)) {
-    const callId = input[frontier].call_id;
-    for (let index = frontier - 1; index >= 0; index -= 1) {
-      if (CALL_TYPES.has(input[index]?.type) && input[index].call_id === callId) {
-        frontier = index;
-        break;
+  if (frontier === 0 || frontier === input.length) return frontier;
+  // Every retained result needs its earlier call, not just the first result at
+  // the cut. Parallel results can arrive out of order or after a message.
+  // Match type as well as id: a function call cannot satisfy a tool-search
+  // output. Existing orphans are left alone; this pass never invents a call.
+  const calls = new Map();
+  const dependencies = new Map();
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (typeof item?.call_id !== "string" || !item.call_id) continue;
+    if (CALL_TYPES.has(item.type)) {
+      if (!calls.has(item.type)) calls.set(item.type, new Map());
+      calls.get(item.type).set(item.call_id, index);
+    } else {
+      const callIndex = calls.get(OUTPUT_CALL_TYPES.get(item.type))?.get(item.call_id);
+      if (callIndex !== undefined) {
+        dependencies.set(index, callIndex);
       }
     }
+  }
+  // Walking backwards through a moving frontier also visits any results pulled
+  // into the tail by an earlier dependency, closing the whole retained suffix.
+  for (let index = input.length - 1; index >= frontier; index -= 1) {
+    const callIndex = dependencies.get(index);
+    if (callIndex !== undefined) frontier = Math.min(frontier, callIndex);
   }
   while (frontier > 0 && CALL_TYPES.has(input[frontier - 1]?.type)) {
     frontier -= 1;
