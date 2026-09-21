@@ -347,6 +347,25 @@ const EMPTY_COMPLETION_PRELUDE_MS =
   configuredEmptyCompletionPreludeMs >= 0
     ? configuredEmptyCompletionPreludeMs
     : 30_000;
+// What the guard allows once the hold above has released. The prelude budget is
+// a "this completion looks empty" window for a provider that answers
+// immediately; it is not a silence budget. A routed hop can be legitimately
+// quiet far longer than that while it works: the loopback Jev hop's upstream is
+// a second router that re-enters this very port with a several-hundred-thousand
+// token context, so both hops can sit on a lifecycle prologue for minutes
+// before the model emits anything. Sizing this at the prelude ended those
+// healthy turns as `precontent_limit`: the stream the client was already
+// reading stopped without a terminal event, which Codex reports as
+// `stream closed before response.completed`. Stay under Codex's own
+// five-minute abandonment and under the shared transport's 300s body idle bound
+// so a genuinely dead stream still fails at the hop that owns it.
+const configuredStreamStallMs = Number(
+  process.env.CODEX_ROUTER_STREAM_STALL_MS || 240_000,
+);
+const STREAM_STALL_MS =
+  Number.isFinite(configuredStreamStallMs) && configuredStreamStallMs > 0
+    ? configuredStreamStallMs
+    : 240_000;
 // Grok can pause between reasoning events for longer than the short prologue
 // budget. Bound that pause independently; never replay an already visible turn.
 // Every transport hop on the Grok path is sized from the same value.
@@ -4720,7 +4739,7 @@ async function handleResponses(request, response, requestUrl) {
               maxPreludeMs: EMPTY_COMPLETION_PRELUDE_MS,
               maxStreamStallMs: canonicalProviderId(route.provider) === "grok-oauth"
                 ? GROK_STREAM_STALL_MS
-                : EMPTY_COMPLETION_PRELUDE_MS,
+                : STREAM_STALL_MS,
             })
           : undefined;
       if (guard) {

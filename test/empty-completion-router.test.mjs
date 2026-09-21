@@ -1775,12 +1775,17 @@ test("a Grok idle past the 30-second prelude still completes", { timeout: 90_000
   }
 });
 
-test("another provider still stalls at the 30-second prelude after reasoning", { timeout: 90_000 }, async () => {
+test("a routed provider past the 30-second prelude is no longer cut off", { timeout: 90_000 }, async () => {
+  // The prelude budget is a hold for an empty completion, not a silence budget.
+  // A routed hop (the loopback Jev hop re-enters this port) can sit quiet for
+  // minutes on a large window; the client-visible symptom of sizing the
+  // post-prologue bound at the prelude was a stream that stopped without a
+  // terminal event, which Codex reports as "stream closed before
+  // response.completed".
   let posts = 0;
-  const gw = await gateway((_request, response) => {
+  const gw = await gateway(delayedAfterReasoning(CONTENT_SSE, 35_000, () => {
     posts += 1;
-    writeReasoningDelta(response);
-  });
+  }));
   const routerPort = await openPort();
   const router = run({
     ...routerEnv(gw.port, routerPort),
@@ -1791,8 +1796,38 @@ test("another provider still stalls at the 30-second prelude after reasoning", {
     const started = Date.now();
     const result = await readRouted(routerPort, TURN_BODY);
     const elapsed = Date.now() - started;
-    assert.ok(elapsed >= 29_000, "other providers keep the existing stall");
-    assert.ok(elapsed < 40_000, "did not inherit the Grok ten-minute bound");
+    assert.ok(elapsed >= 35_000, "waited through a 35-second reasoning idle");
+    assert.ok(elapsed < 60_000, "did not wait for the multi-minute stall bound");
+    assert.doesNotMatch(result.body, /precontent_limit/);
+    assert.match(result.body, /Recovered|response\.completed/);
+    assert.equal(posts, 1, "never replay a visible stream");
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 200);
+    assert.equal(event.emptyCompletionPreludeLimit, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("the post-prologue stall bound stays independently configurable", { timeout: 90_000 }, async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "30000",
+    CODEX_ROUTER_STREAM_STALL_MS: "2500",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, TURN_BODY);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 20_000, "an operator-tuned bound still ends a dead stream");
     assert.match(result.body, /precontent_limit/);
     assert.doesNotMatch(result.body, /Recovered/);
     assert.equal(posts, 1);
