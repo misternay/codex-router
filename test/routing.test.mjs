@@ -7026,7 +7026,6 @@ test("router preserves orphan Codex app outputs as readable history", async () =
     { type: "function_call", call_id: "call-valid", name: "lookup", arguments: "{}" },
     { type: "function_call_output", call_id: "call-valid", output: "kept byte-for-byte" },
   ];
-
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
     for (const endpoint of ["/responses", "/responses/compact"]) {
@@ -9153,6 +9152,7 @@ test("jev/auto receives the complete canonical replay for its executing model", 
     ]).flat(),
     { type: "message", role: "user", content: "Continue from the existing evidence." },
   ];
+  const promptCacheKey = "stable-jev-session-cache-key";
 
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
@@ -9162,11 +9162,17 @@ test("jev/auto receives the complete canonical replay for its executing model", 
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "jev/auto", stream: false, input }),
+      body: JSON.stringify({
+        model: "jev/auto",
+        stream: false,
+        prompt_cache_key: promptCacheKey,
+        input,
+      }),
     });
     assert.equal(response.status, 200, await response.text());
     assert.equal(gatewayBodies.length, 1);
     assert.equal(gatewayBodies[0].model, "jev-auto");
+    assert.equal(gatewayBodies[0].prompt_cache_key, promptCacheKey);
     assert.deepEqual(gatewayBodies[0].input, input);
 
     const [event] = await waitForUsageEvents(stateDir, 1, router);
