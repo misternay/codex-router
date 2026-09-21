@@ -53,6 +53,18 @@ export function conversationWindowEnabled() {
   return process.env.CODEX_ROUTER_CONVERSATION_WINDOW !== "0";
 }
 
+// Native (provider) turns keep their whole conversation by default. Dropping
+// items from them -- their own tool traffic is exactly what the budget trims --
+// makes the upstream model lose the tool-call structure and re-emit calls as
+// text markup (`to=functions.…`, `<|recipient|>…`, `<tool_call>{…}`), which
+// Codex shows as plain text instead of executing. Observed on 21 September
+// 2026: every windowed native call (1, then 78, then 91 items dropped) leaked,
+// every unwindowed call was clean. Opt back in with
+// `CODEX_ROUTER_NATIVE_CONVERSATION_WINDOW=1`.
+export function nativeConversationWindowEnabled() {
+  return process.env.CODEX_ROUTER_NATIVE_CONVERSATION_WINDOW === "1";
+}
+
 // `CODEX_ROUTER_CONVERSATION_WINDOW_KB=<n>` tunes how much of the newest
 // conversation survives. Unset, blank, or unparsable falls back to the default,
 // and `0` keeps only the pinned items plus the current turn. The value is read

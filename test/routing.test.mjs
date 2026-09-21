@@ -9101,6 +9101,9 @@ test("native and Responses routes keep tool-search pairs across the conversation
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
     CODEX_ROUTER_CONVERSATION_WINDOW: "1",
+    // Native turns keep their whole conversation by default, so this case opts
+    // the native side back in to exercise the cut itself.
+    CODEX_ROUTER_NATIVE_CONVERSATION_WINDOW: "1",
     CODEX_ROUTER_CONVERSATION_WINDOW_KB: "64",
     CODEX_ROUTER_QUIET: "1",
     MODEL_ROUTER_STATE_DIR: stateDir,
@@ -9139,6 +9142,54 @@ test("native and Responses routes keep tool-search pairs across the conversation
     }
     const events = await waitForUsageEvents(stateDir, 2, router);
     assert.equal(events.every((event) => event.conversationWindowItemsDropped > 0), true);
+  } finally {
+    await stopChild(router);
+    await closeServer(upstream.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("native turns keep their whole conversation unless the native window is opted in", async () => {
+  const forwarded = [];
+  const upstream = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    forwarded.push(body);
+    json(response, 200, {
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+    });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-native-window-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    // The global pass is on; only the native exemption decides here.
+    CODEX_ROUTER_CONVERSATION_WINDOW: "1",
+    CODEX_ROUTER_CONVERSATION_WINDOW_KB: "64",
+    CODEX_ROUTER_QUIET: "1",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  });
+  const input = [
+    { type: "message", role: "system", content: "Operator rules." },
+    { type: "message", role: "assistant", content: "old".repeat(40_000) },
+    ...Array.from({ length: 3 }, () => ({ type: "message", role: "assistant", content: "Progress." })),
+    { type: "message", role: "user", content: "u".repeat(66_000) },
+  ];
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", stream: false, input }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    // Dropping items from a native turn is what made the upstream model re-emit
+    // its calls as text, so every item travels, including the bulky middle.
+    assert.deepEqual(forwarded.at(-1).input, input);
+    const events = await waitForUsageEvents(stateDir, 1, router);
+    assert.equal((events.at(-1).conversationWindowItemsDropped ?? 0), 0);
+    assert.equal(events.at(-1).conversationWindowBytesSaved ?? 0, 0);
   } finally {
     await stopChild(router);
     await closeServer(upstream.server);

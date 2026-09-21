@@ -249,6 +249,7 @@ import {
 import {
   conversationWindowEnabled,
   conversationWindowTailBytes,
+  nativeConversationWindowEnabled,
   windowConversation,
 } from "./conversation-window.mjs";
 import { VERSION } from "./version.mjs";
@@ -4377,7 +4378,9 @@ async function handleResponses(request, response, requestUrl) {
             enabled: nativeToolResultAgingEnabled(),
           });
           const windowed = windowConversation(aged.input, {
-            enabled: conversationWindowEnabled(),
+            // Native turns are exempt by default: windowing them is what made
+            // the upstream model fall back to its text tool-call syntax.
+            enabled: conversationWindowEnabled() && nativeConversationWindowEnabled(),
             tailBytes: conversationWindowTailBytes(),
           });
           native.input = windowed.input;
