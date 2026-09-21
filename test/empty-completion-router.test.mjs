@@ -1524,6 +1524,8 @@ for (const model of [GROK_OAUTH_MODEL, GROK_API_MODEL, "deepseek/deepseek-v4-pro
     const router = run({
       ...routerEnv(gw.port, routerPort),
       CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+      // Its own post-prologue knob, so a bounded route closes at its bound.
+      CODEX_ROUTER_STREAM_STALL_MS: "25",
     });
     try {
       await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
