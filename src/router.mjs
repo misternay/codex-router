@@ -1004,6 +1004,15 @@ function routedSearchCompatibility(payload, route) {
   return { payload: compatiblePayload, searchMode };
 }
 
+// Jev is a decision router, not the model that consumes this request. It builds
+// its own bounded decision state, then re-enters this router with the selected
+// native model. The outer request must therefore retain Codex's complete
+// canonical replay: aging or windowing it here would make the Jev projection
+// accidentally become the only context available to the executing model.
+function requiresCanonicalReplay(route) {
+  return route?.slug === "jev/auto";
+}
+
 function inputHasWebSearchHistory(input) {
   return Array.isArray(input) && input.some((item) => item?.type === "web_search_call");
 }
@@ -3759,8 +3768,9 @@ async function prepareRoutedRequest({
   normalizedInput,
   agingEnabled,
 }) {
+  const canonicalReplay = requiresCanonicalReplay(route);
   const aged = ageToolResults(normalizedInput, {
-    enabled: agingEnabled,
+    enabled: agingEnabled && !canonicalReplay,
   });
   // A routed turn leaves here as a full conversation replay, so the already
   // consumed middle is dropped before the request is built. The newest slice
@@ -3768,7 +3778,7 @@ async function prepareRoutedRequest({
   // so the pinned instruction head keeps matching the provider's prompt cache
   // instead of being invalidated on every turn.
   const windowed = windowConversation(aged.input, {
-    enabled: conversationWindowEnabled(),
+    enabled: conversationWindowEnabled() && !canonicalReplay,
     tailBytes: conversationWindowTailBytes(),
   });
   const built = await buildRoutedRequest({

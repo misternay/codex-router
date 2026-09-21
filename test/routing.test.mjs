@@ -9080,6 +9080,107 @@ test("a long routed conversation is replayed as a window instead of in full", as
   }
 });
 
+test("jev/auto receives the complete canonical replay for its executing model", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "routing-jev-canonical-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "tool-result-aging.json"),
+    `${JSON.stringify({ version: 1, enabled: true, nativeEnabled: false })}\n`,
+    { mode: 0o600 },
+  );
+  const providersFile = path.join(testRoot, "generic-providers.json");
+  writeFileSync(providersFile, `${JSON.stringify({
+    version: 1,
+    providers: [{
+      id: "jev",
+      displayName: "Jev Router",
+      baseUrl: "http://127.0.0.1:4319/v1",
+      adapter: "openai-responses",
+      headers: {},
+      allowPrivate: true,
+      enabled: true,
+    }],
+  })}\n`);
+  const userModelsFile = path.join(testRoot, "user-models.json");
+  writeFileSync(userModelsFile, `${JSON.stringify({
+    version: 1,
+    models: [{
+      slug: "jev/auto",
+      gatewayModel: "jev-auto",
+      upstreamModel: "auto",
+      provider: "jev",
+      listed: true,
+      displayName: "Jev Codex Router",
+      description: "Test decision router.",
+      priority: 95,
+      defaultEffort: "medium",
+      reasoningLevels: [{ effort: "medium", description: "Balanced reasoning" }],
+      contextWindow: 258400,
+      autoCompact: 219640,
+      inputModalities: ["text", "image"],
+      compHash: "jev-auto-test-v1",
+    }],
+  })}\n`);
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_CONVERSATION_WINDOW: "1",
+    CODEX_ROUTER_CONVERSATION_WINDOW_KB: "64",
+    CODEX_ROUTER_QUIET: "1",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: providersFile,
+    MODEL_ROUTER_USER_MODELS: userModelsFile,
+  });
+  const oldToolOutput = `XMESH result: ${"x".repeat(40_000)}`;
+  const input = [
+    { type: "message", role: "system", content: "Operator rules." },
+    { type: "message", role: "user", content: "The original tweet to inspect." },
+    { type: "message", role: "assistant", content: "Earlier analysis." },
+    { type: "function_call", call_id: "xmesh-old", name: "xmesh_inspect", arguments: "{}" },
+    { type: "function_call_output", call_id: "xmesh-old", output: oldToolOutput },
+    { type: "message", role: "assistant", content: "I used the XMESH result." },
+    ...Array.from({ length: 5 }, (_, index) => [
+      { type: "function_call", call_id: `later-${index}`, name: "exec_command", arguments: "{}" },
+      { type: "function_call_output", call_id: `later-${index}`, output: `later ${index}` },
+      { type: "message", role: "assistant", content: `Progress ${index}: ${"p".repeat(15_000)}` },
+    ]).flat(),
+    { type: "message", role: "user", content: "Continue from the existing evidence." },
+  ];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "jev/auto", stream: false, input }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(gatewayBodies.length, 1);
+    assert.equal(gatewayBodies[0].model, "jev-auto");
+    assert.deepEqual(gatewayBodies[0].input, input);
+
+    const [event] = await waitForUsageEvents(stateDir, 1, router);
+    assert.equal(event.toolResultsAged ?? 0, 0);
+    assert.equal(event.toolResultBytesSaved ?? 0, 0);
+    assert.equal(event.conversationWindowItemsDropped ?? 0, 0);
+    assert.equal(event.conversationWindowBytesSaved ?? 0, 0);
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("native and Responses routes keep tool-search pairs across the conversation window", async () => {
   const forwarded = [];
   const upstream = await mockServer(async (request, response) => {
