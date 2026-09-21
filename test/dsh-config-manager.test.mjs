@@ -63,6 +63,31 @@ test("publishing preserves every other section, route, and comment", () => {
   assert.ok(after.includes("    codex-router:"));
 });
 
+test("an apostrophe elsewhere in the document does not move the route", () => {
+  // A plain scalar carrying an apostrophe used to read as an unterminated
+  // quoted scalar, which hid every key after it from the scan. The route then
+  // landed past the end of `providers:` -- here, inside the block scalar that
+  // follows -- so the harness never saw a route and the user's value grew four
+  // lines of YAML.
+  const settings = [
+    "llm-pi-ai:",
+    "  providers:",
+    "    my-proxy:",
+    "      api: openai-completions",
+    "      note: don't edit this by hand",
+    "theme: dark",
+    "instructions: |",
+    "  it's fine to edit this",
+    "",
+  ].join("\n");
+  const after = applyRouteToSettings(settings, ROUTE);
+  const lines = after.split("\n");
+  assert.equal(lines.indexOf("    codex-router:"), lines.indexOf("      note: don't edit this by hand") + 1);
+  assert.ok(lines.indexOf("    codex-router:") < lines.indexOf("theme: dark"));
+  assert.ok(after.includes("instructions: |\n  it's fine to edit this\n"));
+  assert.equal(removeRouteFromSettings(after), settings);
+});
+
 test("publishing twice is byte-identical", () => {
   const once = applyRouteToSettings(USER_SETTINGS, ROUTE);
   assert.equal(applyRouteToSettings(once, ROUTE), once);

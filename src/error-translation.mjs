@@ -150,8 +150,17 @@ function isOutOfUsage(detail, errorType) {
 // not.
 const OLLAMA_INPUT_LENGTH_PATTERN =
   /input length \((\d+) tokens\) exceeds the model's maximum context length \((\d+) tokens\)/i;
+// Both gaps are lazy, not greedy: a greedy `.{0,N}` backtracks from its
+// longest match downward, so it finds the LAST valid position for the
+// following alternation/digit run within budget rather than the first. Against
+// a message with more than one "input"/"request" occurrence, or a multi-digit
+// number followed by more digits later in the string, that lands the capture
+// mid-token -- e.g. "you requested about 282974 tokens (132890 of text input,
+// 150084 of tool input)" greedily resolves group 2 to a lone trailing "4" from
+// "150084" instead of the real total. Lazy quantifiers find the first valid
+// match instead, landing on "request" and "282974" as intended.
 const SWAPPED_CONTEXT_LENGTH_PATTERN =
-  /maximum context length (?:is|of) (\d+)(?: tokens?)?.{0,80}(?:input|request).{0,40}(\d+)/i;
+  /maximum context length (?:is|of) (\d+)(?: tokens?)?.{0,80}?(?:input|request).{0,40}?(\d+)/i;
 // Console Go names both the estimated prompt and the card. Keep this ahead of
 // the generic "prompt too long" match so those numbers survive into the
 // translated error; the unnumbered sibling still classifies as context.

@@ -637,6 +637,17 @@ The provider's normal credential isolation and generic-provider DNS checks
 still apply. Messages-native provider protocols cannot opt into this OpenAI
 endpoint.
 
+The managed base URL also exposes `/v1/decisions` for OpenRouter's native
+Decisions protocol. A model such as `openrouter-decisions/jev-latest` rides on the same
+stored OpenRouter key as normal chat models, but its provider variant targets
+`https://openrouter.ai/api/alpha`. This route preserves the caller capability,
+body and response bounds, cancellation, and usage metering used by other native
+routes. It is not a chat-completions adapter and does not synthesize an
+assistant message; callers submit and consume the structured Decisions payload.
+The Jev route is intentionally unlisted, so it cannot appear in Codex's
+conversational model picker. It is for an explicit local integration such as
+jev-pruner, never a substitute for Codex native compaction.
+
 ### opencode (Go subscription and Zen)
 
 The opencode provider family covers both of opencode's endpoints with one
@@ -1450,6 +1461,26 @@ The optional native redirect is independent of this switch and of model
 failover. If native redirect is set, every unmatched native GPT turn that
 reaches the router continues to use its configured external route until
 `./bin/control native-redirect clear` is run.
+
+If **Approve for me** stops working once the ChatGPT plan is exhausted, that is
+a separate quota from the session's. Codex runs automatic approval reviews on
+its own hidden native model, so a session answered by an external provider can
+keep reasoning and proposing commands while every review still costs ChatGPT
+quota. Name a routed model to take those reviews over when that happens:
+
+```
+./bin/control auto-review-fallback set kimi-oauth/k3
+./bin/control auto-review-fallback status
+./bin/control auto-review-fallback clear
+```
+
+The fallback engages only after Codex's own reviewer has refused a review *for
+quota*, and only for the window that refusal named. A denial, a policy
+rejection, a malformed answer, and any other failure all stay with the native
+reviewer -- a `deny` is a decision, and it is never retried through another
+model. The first answer the native reviewer gives afterwards ends the window,
+so reviews return to it on their own. It changes nothing about which model runs
+the session.
 
 ### Use Codex without an OpenAI login
 

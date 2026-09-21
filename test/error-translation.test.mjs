@@ -518,6 +518,41 @@ test("a numeric Console Go prompt-too-long keeps both token counts", () => {
   assert.equal(upstreamFailureKind({ status: 400, bodyText }), undefined);
 });
 
+test("an OpenRouter overflow with two input/request occurrences keeps the real total, not a truncated digit", () => {
+  // Regression for the greedy-backtracking bug in SWAPPED_CONTEXT_LENGTH_PATTERN:
+  // "you requested" and "text input" both match the (?:input|request)
+  // alternation, and "150084" contains more digits after wherever a greedy
+  // `.{0,N}` gap would land. A greedy version of this pattern resolved
+  // group 2 to a lone "4" (the last digit of "150084") instead of the real
+  // 282974 total.
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "litellm.BadRequestError: OpenAIException - This endpoint's maximum context length "
+        + "is 262144 tokens. However, you requested about 282974 tokens (132890 of text "
+        + "input, 150084 of tool input). Please reduce the length of either one, or use the "
+        + "context-compression plugin to compress your prompt automatically.. Received "
+        + "Model Group=openrouter-union-alpha\nAvailable Model Group Fallbacks=None",
+      type: null,
+      param: null,
+      code: "400",
+    },
+  });
+
+  const result = contextLengthFailure(bodyText);
+  assert.equal(result.maximumTokens, 262144);
+  assert.equal(result.inputTokens, 282974);
+
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText,
+    modelName: "Union Alpha (OpenRouter)",
+    providerName: "openrouter",
+  });
+  assert.match(payload.error.message, /282,974 tokens/);
+  assert.doesNotMatch(payload.error.message, /is 4 tokens/);
+});
+
 test("Console Go prompt-too-long-including-completion is a context error, not quota", () => {
   const bodyText = JSON.stringify({
     type: "error",
