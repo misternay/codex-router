@@ -422,7 +422,7 @@ test("rankFailoverCandidates orders a tier by the registry's own preference", ()
 });
 
 test("rankFailoverCandidates admits a same-family 1M sibling only when asked", () => {
-  const from = model("opencode-go-messages/union-alpha", "opencode-go-messages", {
+  const from = model("opencode-go-messages/minimax-m3", "opencode-go-messages", {
     contextWindow: 262_144,
   });
   const largeSibling = model("opencode-go/glm-5.3-flash", "opencode-go", {
@@ -472,7 +472,7 @@ test("classifyRoutedFailure does not swap a Console Go context-length 400", () =
   const bodyText = JSON.stringify({
     error: {
       message:
-        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=opencode-go-messages-union-alpha\nAvailable Model Group Fallbacks=None`,
+        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=opencode-go-messages-minimax-m3\nAvailable Model Group Fallbacks=None`,
     },
   });
   assert.equal(classifyRoutedFailure({ status: 400, bodyText, now: NOW }).swap, false);
