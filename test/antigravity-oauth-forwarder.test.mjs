@@ -683,9 +683,10 @@ test("ends a started stream with an OpenAI error frame after an idle timeout", a
   }, {
     status: 504,
     providerCode: "upstream_idle_timeout",
-    message: "Google Antigravity sent no stream data for 30ms.",
+    message: "Google Antigravity sent no stream data for 1000ms.",
   }, {
-    ANTIGRAVITY_IDLE_TIMEOUT_MS: "30",
+    // Leave room for process scheduling when the full suite runs concurrently.
+    ANTIGRAVITY_IDLE_TIMEOUT_MS: "1000",
   });
 });
 

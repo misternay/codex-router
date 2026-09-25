@@ -406,7 +406,7 @@ function fillUnreplayedReasoning(messages) {
   });
 }
 
-function ensureToolCallReasoningContent(messages) {
+function ensureToolCallReasoningContent(messages, { hasTools = false } = {}) {
   if (!Array.isArray(messages)) return messages;
   return messages.map((message) => {
     if (
@@ -426,6 +426,7 @@ function ensureToolCallReasoningContent(messages) {
     // history preserves by call id even across compaction.
     const remembered = reasoningForToolCalls(toolCallIdsOf(message));
     if (remembered) return { ...message, reasoning_content: remembered };
+    if (!hasTools) return message;
     // Nothing remembered: keep the field present, exactly as before.
     return typeof message.reasoning_content === "string"
       ? message
@@ -1239,7 +1240,9 @@ function normalizeBody(buffer, contentType, route) {
       });
     }
     if (requiresReasoningContentOnToolCalls(model)) {
-      payload.messages = ensureToolCallReasoningContent(payload.messages);
+      payload.messages = ensureToolCallReasoningContent(payload.messages, {
+        hasTools: Array.isArray(payload.tools) && payload.tools.length > 0,
+      });
     }
   }
   if (provider.authProfile === "github-copilot") {
