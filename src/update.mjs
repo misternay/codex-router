@@ -12,8 +12,22 @@ import {
   traySupervisionPreferencePath,
 } from "./tray-supervision-preference.mjs";
 
+function embeddedMonorepoRoot(sourceRoot = SOURCE_ROOT) {
+  const candidate = path.dirname(sourceRoot);
+  return (
+    path.basename(sourceRoot) === "router" &&
+    existsSync(path.join(candidate, "ROUTER_FORK.md")) &&
+    existsSync(path.join(candidate, ".git"))
+  )
+    ? candidate
+    : undefined;
+}
+
+export const EMBEDDED_MONOREPO_ROOT = embeddedMonorepoRoot();
+export const CHECKOUT_ROOT = EMBEDDED_MONOREPO_ROOT || SOURCE_ROOT;
+
 function git(args, options = {}) {
-  const output = execFileSync("git", ["-C", SOURCE_ROOT, ...args], {
+  const output = execFileSync("git", ["-C", CHECKOUT_ROOT, ...args], {
     encoding: "utf8",
     stdio: options.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
   });
@@ -26,12 +40,13 @@ function requireManagedCheckout() {
       "This installation is managed by Homebrew. Upgrade it with `brew upgrade codex-router`.",
     );
   }
-  if (!existsSync(path.join(SOURCE_ROOT, ".git"))) {
+  if (!existsSync(path.join(CHECKOUT_ROOT, ".git"))) {
     throw new Error(
       "This release is not a Git checkout. Re-run the installation command to upgrade it.",
     );
   }
   const origin = git(["remote", "get-url", "origin"]);
+  if (EMBEDDED_MONOREPO_ROOT) return;
   const configured = process.env.CODEX_ROUTER_REPOSITORY_URL;
   const allowed = new Set([
     configured,
@@ -60,7 +75,7 @@ export function localModifications() {
     .filter(Boolean);
 }
 
-export function localModificationsMessage(changes, sourceRoot = SOURCE_ROOT) {
+export function localModificationsMessage(changes, sourceRoot = CHECKOUT_ROOT) {
   const preview = changes
     .slice(0, DIRTY_PREVIEW_LIMIT)
     .map((line) => `  ${line}`)
@@ -113,13 +128,20 @@ export function currentCheckoutInstaller(
           target,
         ],
       }
-    : { command: path.join(SOURCE_ROOT, "bin", posixScript), args: [] };
+    : {
+        command: (
+          EMBEDDED_MONOREPO_ROOT && posixScript === "install"
+            ? path.join(EMBEDDED_MONOREPO_ROOT, "install.sh")
+            : path.join(SOURCE_ROOT, "bin", posixScript)
+        ),
+        args: [],
+      };
 }
 
 function installCurrentCheckout() {
   const installer = currentCheckoutInstaller();
   const result = spawnSync(installer.command, installer.args, {
-    cwd: SOURCE_ROOT,
+    cwd: EMBEDDED_MONOREPO_ROOT || SOURCE_ROOT,
     stdio: "inherit",
     env: { ...process.env, MODEL_ROUTER_TARGET: TARGET },
   });

@@ -1578,7 +1578,7 @@ async function relayUpstreamResponse(
     upstream.ok && upstreamContentType.toLowerCase().includes("text/event-stream");
   const responsesJson = normalized.responseAdapter === "responses" &&
     upstream.ok && upstreamContentType.toLowerCase().includes("application/json");
-  
+
   // Direct DeepSeek calls arrive with an outer, authoritative namespace/custom
   // map. Preserve their wire names here; guessing a namespace from a flattened
   // name would restore it before the outer custom-tool bridge can consume it.
@@ -1586,7 +1586,7 @@ async function relayUpstreamResponse(
   const flatToNative = (responsesStream || responsesJson) && !usesDeepSeekResponses(normalized.model)
     ? buildNamespaceLookupsFromTools(normalized.payload?.tools)
     : new Map();
-  
+
   const transform = [
     responsesStream ? createResponsesStreamTransform(flatToNative) : undefined,
     responsesJson ? createResponsesJsonTransform(flatToNative) : undefined,

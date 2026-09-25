@@ -7,6 +7,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  CHECKOUT_ROOT,
+  EMBEDDED_MONOREPO_ROOT,
   checkForUpdate,
   currentCheckoutInstaller,
   installationNeedsRefresh,
@@ -24,8 +26,26 @@ test("checkout updates preserve the codex target on every platform", () => {
   assert.deepEqual(windowsCodex.args.slice(-2), ["-Target", "codex"]);
 
   const posixCodex = currentCheckoutInstaller("darwin", "codex");
-  assert.match(posixCodex.command, /bin[\\/]install$/);
+  assert.equal(
+    posixCodex.command,
+    EMBEDDED_MONOREPO_ROOT
+      ? path.join(EMBEDDED_MONOREPO_ROOT, "install.sh")
+      : path.join(repoRoot, "bin", "install"),
+  );
   assert.deepEqual(posixCodex.args, []);
+});
+
+test("the embedded fork updates and installs through its owning monorepo", () => {
+  assert.equal(EMBEDDED_MONOREPO_ROOT, path.dirname(repoRoot));
+  assert.equal(CHECKOUT_ROOT, EMBEDDED_MONOREPO_ROOT);
+  assert.equal(
+    currentCheckoutInstaller("darwin", "codex").command,
+    path.join(EMBEDDED_MONOREPO_ROOT, "install.sh"),
+  );
+  assert.equal(
+    currentCheckoutInstaller("darwin", "codex", { posixScript: "enable" }).command,
+    path.join(repoRoot, "bin", "enable"),
+  );
 });
 
 test("a bare invocation updates and an explicit check stays read-only", () => {
@@ -270,5 +290,10 @@ test("Windows runs one installer whichever entry point is asked for", () => {
 });
 
 test("the default entry point is still install", () => {
-  assert.match(currentCheckoutInstaller("darwin", "codex").command, /bin[\\/]install$/);
+  assert.equal(
+    currentCheckoutInstaller("darwin", "codex").command,
+    EMBEDDED_MONOREPO_ROOT
+      ? path.join(EMBEDDED_MONOREPO_ROOT, "install.sh")
+      : path.join(repoRoot, "bin", "install"),
+  );
 });

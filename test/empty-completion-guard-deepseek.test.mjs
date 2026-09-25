@@ -63,13 +63,13 @@ test("Large MCP tool declarations plus reasoning before tool call should not hit
       param5: { type: "string", description: "v".repeat(10000) },
     }
   });
-  
+
   // Build a large response.created event with many tools
   const manyTools = [];
   for (let i = 0; i < 15; i++) {
     manyTools.push({ name: `mcp_tool_${i}`, schema: largeToolSchema });
   }
-  
+
   const createdEvent = {
     type: "response.created",
     response: {
@@ -78,16 +78,16 @@ test("Large MCP tool declarations plus reasoning before tool call should not hit
       metadata: { large_field: "x".repeat(50000) }
     }
   };
-  
+
   // ~800KB in response.created
   const createdBlock = block(
     'event: response.created',
     `data: ${JSON.stringify(createdEvent)}`
   );
-  
+
   // Add reasoning that pushes total over 1MB
   const reasoning = "thinking".repeat(30000); // ~240KB
-  
+
   const input = [
     createdBlock,
     block(
@@ -125,7 +125,7 @@ test("Large MCP tool declarations plus reasoning before tool call should not hit
 test("Bug #684: incremental delivery of massive reasoning should not kill stream", async () => {
   // Simulate realistic network chunking: large reasoning arrives in small pieces
   const massiveReasoning = "x".repeat(1100000); // 1.1 MB reasoning
-  
+
   const input = [
     block(
       'event: response.created',
@@ -181,7 +181,7 @@ test("Bug #684: incremental delivery of massive reasoning should not kill stream
 test("Incomplete massive reasoning event should not hit parse buffer limit", async () => {
   // Create a massive data payload that will be incomplete (no double newline yet)
   const massiveReasoning = "x".repeat(1100000); // 1.1 MB
-  
+
   const input = [
     block(
       'event: response.created',
@@ -233,11 +233,11 @@ test("Incomplete massive reasoning event should not hit parse buffer limit", asy
 test("Massive reasoning after liveness release should not kill stream before tool call", async () => {
   // First, release for liveness with initial reasoning
   const initialReasoning = "initial thinking...";
-  
+
   // Then add MASSIVE reasoning that will exceed parse buffer limit (>1MB)
   // while parsing behind the relay AFTER the stream was released for liveness
   const massiveReasoning = "x".repeat(1100000); // 1.1 MB
-  
+
   const input = [
     block(
       'event: response.created',

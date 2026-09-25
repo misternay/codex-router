@@ -274,8 +274,19 @@ function requestAbortError(signal) {
 
 function boundedSignal(parent, timeoutMs) {
   if (parent?.aborted) throw requestAbortError(parent);
-  const timeout = AbortSignal.timeout(timeoutMs);
-  return parent ? AbortSignal.any([parent, timeout]) : timeout;
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(parent.reason);
+  const handle = setTimeout(
+    () => controller.abort(new Error("Search sidecar operation deadline exceeded.")),
+    timeoutMs,
+  );
+  if (parent) parent.addEventListener("abort", onParentAbort, { once: true });
+  const dispose = () => {
+    clearTimeout(handle);
+    parent?.removeEventListener("abort", onParentAbort);
+  };
+  controller.signal.addEventListener("abort", dispose, { once: true });
+  return { signal: controller.signal, dispose };
 }
 
 async function boundedSleep(milliseconds, signal) {
@@ -407,7 +418,8 @@ export async function executeSearchSidecar({
       error.telemetry = { cacheHit: false, attempts, durationMs: Math.max(0, now() - started), providerId: provider.id };
       throw error;
     }
-    const attemptSignal = boundedSignal(signal, remaining);
+    const attempt = boundedSignal(signal, remaining);
+    const attemptSignal = attempt.signal;
     let dispatcher;
     try {
       const result = await boundedPromise(requestProvider(provider.id, "/search", {
@@ -488,8 +500,14 @@ export async function executeSearchSidecar({
       const delay = Math.min(binding.retryDelayMs * 2 ** attempts, remainingAfterAttempt);
       await dispatcher?.close?.().catch(() => undefined);
       dispatcher = undefined;
-      await sleep(delay, boundedSignal(signal, Math.max(1, remainingAfterAttempt)));
+      const retryDelay = boundedSignal(signal, Math.max(1, remainingAfterAttempt));
+      try {
+        await sleep(delay, retryDelay.signal);
+      } finally {
+        retryDelay.dispose();
+      }
     } finally {
+      attempt.dispose();
       await dispatcher?.close?.().catch(() => undefined);
     }
   }

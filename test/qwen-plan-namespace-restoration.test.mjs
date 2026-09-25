@@ -181,7 +181,7 @@ data: [DONE]
   // The output should contain the restored namespace
   assert.ok(output.includes('"namespace":"multi_agent_v1"'), "Should restore namespace field");
   assert.ok(output.includes('"name":"spawn_agent"'), "Should restore name field");
-  
+
   // Parse the SSE output to verify the structure
   const lines = output.split("\n");
   let outputItemData = null;
@@ -195,7 +195,7 @@ data: [DONE]
       }
     }
   }
-  
+
   assert.ok(outputItemData, "Should find output_item.added event data");
   assert.equal(outputItemData.item.namespace, "multi_agent_v1");
   assert.equal(outputItemData.item.name, "spawn_agent");

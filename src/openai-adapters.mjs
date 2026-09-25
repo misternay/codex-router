@@ -19,12 +19,12 @@ const COLLABORATION_NAMESPACES = new Set([
 export function buildNamespaceLookupsFromTools(tools) {
   const flatToNative = new Map();
   if (!Array.isArray(tools)) return flatToNative;
-  
+
   // First, collect namespace tools to build the authoritative mapping
   const namespaceTools = new Map();
   for (const tool of tools) {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
-    
+
     if (tool.type === "namespace" && typeof tool.name === "string" && Array.isArray(tool.tools)) {
       // This is a type: "namespace" entry, record all its child tools
       for (const child of tool.tools) {
@@ -34,7 +34,7 @@ export function buildNamespaceLookupsFromTools(tools) {
       }
     }
   }
-  
+
   // Namespace containers alone are enough to restore calls (Responses-native
   // providers keep that shape). Seed the map before scanning flat functions.
   for (const [flattenedName, native] of namespaceTools) {
@@ -47,46 +47,46 @@ export function buildNamespaceLookupsFromTools(tools) {
   for (const tool of tools) {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
     if (tool.type === "namespace") continue; // Skip namespace containers
-    
-    // Extract function name from either Responses format (tool.name) or 
+
+    // Extract function name from either Responses format (tool.name) or
     // Chat Completions format (tool.function.name)
     const functionName = tool.name || tool.function?.name;
     if (typeof functionName !== "string" || !functionName) continue;
-    
+
     // Check if this looks like a flattened name
     const delimiterIndex = functionName.indexOf(NAMESPACE_DELIMITER);
     if (delimiterIndex === -1) continue;
-    
+
     // If this name was from a namespace tool, use that mapping
     if (namespaceTools.has(functionName)) {
       flatToNative.set(functionName, namespaceTools.get(functionName));
       continue;
     }
-    
+
     // Otherwise, only restore known collaboration namespaces to avoid false positives
     // Split on first delimiter: "multi_agent_v1__spawn_agent" -> ["multi_agent_v1", "spawn_agent"]
     const firstDelimiterEnd = delimiterIndex + NAMESPACE_DELIMITER.length;
     const namespace = functionName.substring(0, delimiterIndex);
     const name = functionName.substring(firstDelimiterEnd);
-    
+
     if (COLLABORATION_NAMESPACES.has(namespace)) {
       flatToNative.set(functionName, { namespace, name });
     }
   }
-  
+
   return flatToNative;
 }
 
 // Restore a function call from flattened name to namespaced shape
 function restoreNamespacedFunctionCall(call, flatToNative) {
   if (!call || typeof call !== "object" || !flatToNative.size) return call;
-  
+
   const callName = call.name;
   if (typeof callName !== "string") return call;
-  
+
   const native = flatToNative.get(callName);
   if (!native) return call;
-  
+
   // Return the call with namespace restored and flattened name removed
   return {
     ...call,
@@ -298,7 +298,7 @@ function normalizeResponseBody(payload, flatToNative) {
   if (next.output !== undefined && !Array.isArray(next.output)) {
     throw upstreamResponseError("The upstream Responses response has an invalid output array.");
   }
-  
+
   // Restore namespaces in function call items within the output array
   if (Array.isArray(next.output) && flatToNative && flatToNative.size > 0) {
     next.output = next.output.map((item) => {
@@ -308,7 +308,7 @@ function normalizeResponseBody(payload, flatToNative) {
       return item;
     });
   }
-  
+
   return next;
 }
 
@@ -464,7 +464,7 @@ function normalizeResponsesEvent(frame, state, flatToNative) {
     }
     state.outputIndex = index + 1;
     if (!validOutputIndex(data.output_index)) data.output_index = index;
-    
+
     // Restore namespace for function call items
     if (item.type === "function_call" && flatToNative && flatToNative.size > 0) {
       const restored = restoreNamespacedFunctionCall(item, flatToNative);

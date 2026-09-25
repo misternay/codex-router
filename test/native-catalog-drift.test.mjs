@@ -130,14 +130,14 @@ test("drift detection triggers republish with new arbitrary native in merged out
         return { status: "updated" };
       },
     });
-    
+
     // Republish should have succeeded
     assert.equal(republished, true, "republish succeeded");
 
     // VERIFY: merged-models.json or native-models.json should now contain NEW arbitrary native
     const updated = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
     const updatedSlugs = updated.models.map(m => m.slug);
-    
+
     assert.ok(
       updatedSlugs.includes("gpt-7-prime"),
       "NEW arbitrary native (gpt-7-prime) appears in native-models.json after republish"
@@ -154,7 +154,7 @@ test("drift detection triggers republish with new arbitrary native in merged out
     else delete process.env.CODEX_HOME;
     if (originalTarget !== undefined) process.env.MODEL_ROUTER_TARGET = originalTarget;
     else delete process.env.MODEL_ROUTER_TARGET;
-    
+
     rmSync(tempDir, { recursive: true, force: true });
   }
 });
