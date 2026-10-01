@@ -829,7 +829,7 @@ export const en = {
   "models.effort.max": "Max",
   "models.effort.ultra": "Ultra",
   "models.add.title": "Add models",
-  "models.add.description": "Everything your connected providers offer. Adding a model makes it available to the router; use the picker switch to show it in your clients.",
+  "models.add.description": "Add conversation models for Codex. Decisions, embeddings and other tool APIs use separate integrations. Choosing a model here changes the Codex assistant; it does not enable a tool.",
   "models.add.search": "Search every connected provider",
   "models.add.loadingCatalogs": "Loading catalogs",
   "models.add.count": "{shown} of {total} models",

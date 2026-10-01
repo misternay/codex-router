@@ -788,7 +788,7 @@ export const zhCN = {
   "models.effort.xhigh": "很高",
   "models.effort.ultra": "极高",
   "models.add.title": "添加模型",
-  "models.add.description": "已连接服务商提供的全部模型。添加后即可供路由器使用；再用选择器开关把它显示在你的客户端中。",
+  "models.add.description": "在这里添加用于 Codex 对话的模型。Decisions、嵌入和其他工具 API 需要单独集成。选择这里的模型会切换 Codex 助手，不会启用工具。",
   "models.add.search": "搜索所有已连接的服务商",
   "models.add.loadingCatalogs": "正在加载目录",
   "models.add.count": "{total} 个模型中的 {shown} 个",

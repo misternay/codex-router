@@ -421,11 +421,14 @@ async function main() {
     router,
   );
 
-  // After router is healthy, refresh the native account catalog and check its
-  // cache plus the installed Codex binary for drift in the background.
-  // This runs async without blocking further startup or waiting for user commands.
+  // Keep the native catalog fresh while the service is alive, including while
+  // Codex Desktop is closed, so its next startup reads newly released models.
+  // The immediate pass also handles an already stale cache after service boot.
   import("./native-catalog-drift.mjs")
-    .then(({ republishOnNativeDrift }) => republishOnNativeDrift())
+    .then(({ republishOnNativeDrift, watchNativeCatalog }) => {
+      watchNativeCatalog();
+      return republishOnNativeDrift();
+    })
     .catch((error) => {
       console.error(`[codex-router] Native drift check failed: ${error.message}`);
     });

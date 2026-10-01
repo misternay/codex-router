@@ -728,6 +728,11 @@ export function openBrowserCommand(executable, args, cwd, {
           }, completionTimeoutMs);
           completionTimeout.unref?.();
         }
+        // Keep the detached child referenced until browser handoff succeeds:
+        // an early child exit must still deliver its close notification while
+        // the opener is pending. After handoff, the OAuth login can continue
+        // without retaining the Control Center process.
+        child.unref();
         resolveOpen({ opened: true, surface: "browser" });
       })
       .catch((error) => {
@@ -757,7 +762,6 @@ export function openBrowserCommand(executable, args, cwd, {
   } catch (error) {
     void abort(error);
   }
-  child.unref();
   return opened;
 }
 

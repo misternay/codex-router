@@ -405,15 +405,19 @@ function commandCodeSurface() {
   ];
 }
 
-for (const providerId of ["commandcode", "commandcode-messages"]) {
+for (const [providerId, upstreamModel] of [
+  ["commandcode"],
+  ["commandcode-messages"],
+  ["openrouter", "meta/muse-spark-1.3-contributor"],
+]) {
   test(`${providerId} bounds provider-facing tool names to 64 characters`, () => {
     assert.equal(COMMAND_CODE_LONG_TOOL.length, 80, "regression fixture reproduces issue #626");
-    const routed = chatProviderToolSurface(commandCodeSurface(), providerId);
+    const routed = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
     const names = routed.tools.map((tool) => tool.name);
     for (const name of names) {
       assert.ok(
         name.length <= 64,
-        `${name} is ${name.length} characters, which Command Code rejects`,
+        `${name} is ${name.length} characters, which the upstream rejects`,
       );
     }
     const alias = names.find((name) => name !== "codex_app__create_thread");
@@ -434,8 +438,8 @@ for (const providerId of ["commandcode", "commandcode-messages"]) {
   });
 
   test(`${providerId} keeps the bounded alias deterministic across identical surfaces`, () => {
-    const first = chatProviderToolSurface(commandCodeSurface(), providerId);
-    const second = chatProviderToolSurface(commandCodeSurface(), providerId);
+    const first = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
+    const second = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
     assert.deepEqual(
       first.tools.map((tool) => tool.name),
       second.tools.map((tool) => tool.name),
@@ -564,10 +568,17 @@ test("collision aliases are the same on a bounded and an unbounded provider", ()
   assert.deepEqual(unbounded, bounded);
 });
 
-test("a non-Command Code chat provider keeps the unbounded 80-character name", () => {
-  const routed = chatProviderToolSurface(commandCodeSurface(), "openrouter");
-  assert.ok(
-    routed.tools.some((tool) => tool.name === COMMAND_CODE_LONG_TOOL),
-    "only Command Code opts into the 64-character bound",
-  );
-});
+for (const [providerId, upstreamModel] of [
+  ["openrouter"],
+  ["openrouter", "meta/muse-spark-1.3"],
+  ["openrouter", "meta/muse-spark-1.2-contributor"],
+  ["nousresearch", "meta/muse-spark-1.3-contributor"],
+]) {
+  test(`${providerId}/${upstreamModel} keeps the unbounded 80-character name`, () => {
+    const routed = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
+    assert.ok(
+      routed.tools.some((tool) => tool.name === COMMAND_CODE_LONG_TOOL),
+      "unaffected routes retain their original names",
+    );
+  });
+}

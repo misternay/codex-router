@@ -104,6 +104,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.8-flash",
       "commandcode/qwen3.8-max-0902",
       "commandcode/qwen3.8-max",
+      "commandcode/stealth/space-bunny-alpha",
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b",
       "deepseek/deepseek-v4-flash",
@@ -1478,6 +1479,17 @@ test("direct Meta Muse Spark 1.3 Contributor flattens recursive tool schemas", (
   const verified = MODELS.find((model) => model.slug === "meta/muse-spark-1.3-contributor");
   assert.ok(verified, "expected the checked-in direct Meta 1.3 Contributor route");
   assert.equal(verified.toolSchemaRecursion, "flatten");
+});
+
+test("OpenRouter Muse Spark 1.3 Contributor alone opts into recursive-schema repair", () => {
+  const verified = MODELS.find(model => model.slug === "openrouter/muse-spark-1.3-contributor");
+  assert.ok(verified);
+  assert.equal(verified.toolSchemaRecursion, "flatten");
+  for (const slug of ["openrouter/muse-spark-1.3", "openrouter/muse-spark-1.2-contributor"]) {
+    const control = MODELS.find(model => model.slug === slug);
+    assert.ok(control);
+    assert.equal(control.toolSchemaRecursion, undefined);
+  }
 });
 
 test("curated OpenCode Free Muse overlay upgrades text-only image modalities", async () => {

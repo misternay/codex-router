@@ -845,6 +845,11 @@ function modelProblem(model, providers, slugs, gatewayModels) {
       return `model ${model.slug} has an invalid upgradeTo`;
     }
   }
+  // Only an explicit boolean may change failover eligibility; anything else is
+  // a typo that would otherwise silently leave the route eligible.
+  if (model.failoverCandidate !== undefined && typeof model.failoverCandidate !== "boolean") {
+    return `model ${model.slug} has an invalid failoverCandidate`;
+  }
   if (slugs.has(model.slug)) return `duplicate model slug ${model.slug}`;
   if (gatewayModels.has(model.gatewayModel)) {
     return `duplicate gateway model ${model.gatewayModel}`;

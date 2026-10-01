@@ -831,7 +831,7 @@ export const zhTW = {
   "models.effort.max": "最高",
   "models.effort.ultra": "極致",
   "models.add.title": "加入模型",
-  "models.add.description": "你已連線供應商提供的所有內容。加入模型會讓路由器可使用它；請用挑選器開關在用戶端顯示。",
+  "models.add.description": "在這裡加入用於 Codex 對話的模型。Decisions、嵌入及其他工具 API 需要另外整合。選擇這裡的模型會切換 Codex 助手，不會啟用工具。",
   "models.add.search": "搜尋所有已連線的供應商",
   "models.add.loadingCatalogs": "載入目錄",
   "models.add.count": "{total} 個模型中的 {shown} 個",

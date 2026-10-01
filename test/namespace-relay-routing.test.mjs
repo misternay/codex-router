@@ -1656,6 +1656,71 @@ test("bounded routes preserve one alias for pre-flattened MCP definitions and hi
   }
 });
 
+test("OpenRouter Muse preserves bounded aliases through MCP history and streamed or JSON responses", async () => {
+  const namespace = "mcp__neon__apm__production__snapshot__read_only";
+  const name = "get_monitor_snapshot_with_complete_context";
+  const wireName = `${namespace}__${name}`;
+  for (const stream of [true, false]) {
+    const result = await scenario(stream, {
+      model: "openrouter/muse-spark-1.3-contributor",
+      requestPayload: preflattenedBoundedMcpPayload,
+      sseBody: (outgoing) => {
+        const providerName = outgoing.tools.find(
+          (tool) => tool.description === "Long preflattened MCP fixture.",
+        ).name;
+        return [
+          sseEvent({
+            type: "response.output_item.done",
+            item: {
+              type: "function_call",
+              name: providerName,
+              call_id: "call_snapshot",
+              arguments: "{}",
+            },
+          }),
+          sseEvent({ type: "response.completed" }),
+          "data: [DONE]\n\n",
+        ].join("");
+      },
+      jsonBody: (outgoing) => {
+        const providerName = outgoing.tools.find(
+          (tool) => tool.description === "Long preflattened MCP fixture.",
+        ).name;
+        return {
+          id: "resp_preflattened_bounded",
+          output: [{
+            type: "function_call",
+            name: providerName,
+            call_id: "call_snapshot",
+            arguments: "{}",
+          }],
+        };
+      },
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    const outgoing = result.gatewayBodies[0];
+    assert.equal(outgoing.client_metadata, undefined);
+    const providerTool = outgoing.tools.find(
+      (tool) => tool.description === "Long preflattened MCP fixture.",
+    );
+    assert.notEqual(providerTool.name, wireName);
+    assert.ok(providerTool.name.length <= 64);
+    const historyCall = outgoing.input.find(
+      (item) => item.call_id === "call_previous_snapshot",
+    );
+    assert.equal(historyCall.name, providerTool.name);
+    assert.equal(historyCall.namespace, undefined);
+
+    const call = stream
+      ? functionCallsFromSse(result.clientBody).get("call_snapshot")
+      : JSON.parse(result.clientBody).output[0];
+    assert.deepEqual(
+      { namespace: call.namespace, name: call.name },
+      { namespace, name },
+    );
+  }
+});
+
 test("non-streaming routed responses restore namespace calls before client dispatch", async () => {
   const result = await scenario(false, {
     requestPayload: (stream, model) => {

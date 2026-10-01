@@ -274,19 +274,14 @@ function requestAbortError(signal) {
 
 function boundedSignal(parent, timeoutMs) {
   if (parent?.aborted) throw requestAbortError(parent);
+  // AbortSignal.timeout() uses an unreferenced timer. If an upstream adapter
+  // never settles, Node can exit before delivering the operation deadline.
   const controller = new AbortController();
-  const onParentAbort = () => controller.abort(parent.reason);
-  const handle = setTimeout(
-    () => controller.abort(new Error("Search sidecar operation deadline exceeded.")),
-    timeoutMs,
-  );
-  if (parent) parent.addEventListener("abort", onParentAbort, { once: true });
-  const dispose = () => {
-    clearTimeout(handle);
-    parent?.removeEventListener("abort", onParentAbort);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: parent ? AbortSignal.any([parent, controller.signal]) : controller.signal,
+    clear: () => clearTimeout(timer),
   };
-  controller.signal.addEventListener("abort", dispose, { once: true });
-  return { signal: controller.signal, dispose };
 }
 
 async function boundedSleep(milliseconds, signal) {
@@ -500,14 +495,15 @@ export async function executeSearchSidecar({
       const delay = Math.min(binding.retryDelayMs * 2 ** attempts, remainingAfterAttempt);
       await dispatcher?.close?.().catch(() => undefined);
       dispatcher = undefined;
-      const retryDelay = boundedSignal(signal, Math.max(1, remainingAfterAttempt));
+      attempt.clear();
+      const retry = boundedSignal(signal, Math.max(1, remainingAfterAttempt));
       try {
-        await sleep(delay, retryDelay.signal);
+        await sleep(delay, retry.signal);
       } finally {
-        retryDelay.dispose();
+        retry.clear();
       }
     } finally {
-      attempt.dispose();
+      attempt.clear();
       await dispatcher?.close?.().catch(() => undefined);
     }
   }
