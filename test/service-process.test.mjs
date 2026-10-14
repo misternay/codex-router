@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,7 +8,12 @@ import test from "node:test";
 import {
   buildServiceProcessState,
   clearServiceProcessState,
+  probeServiceProcessState,
+  readServiceProcessState,
+  shouldRecordServiceProcess,
   serviceProcessOwns,
+  serviceProcessOwnership,
+  serviceRecordSettled,
   writeServiceProcessState,
 } from "../src/service-process.mjs";
 
@@ -21,6 +27,56 @@ function identity() {
 function commandLine() {
   return `node "${root}/src/start.mjs"`;
 }
+
+test("startup names the unavailable or mismatching probe without exposing its output", () => {
+  const options = { pid: 4242, identity, commandLine, sourceRoot: root, stateDir };
+  assert.equal(probeServiceProcessState({ ...options, pid: 0 }).failure, "pid-invalid");
+  assert.equal(probeServiceProcessState({ ...options, identity: () => undefined }).failure, "identity-unavailable");
+  assert.equal(probeServiceProcessState({ ...options, commandLine: () => undefined }).failure, "command-line-unavailable");
+  assert.equal(probeServiceProcessState({ ...options, commandLine: () => "other process" }).failure, "command-line-mismatch");
+  assert.throws(() => writeServiceProcessState({ ...options, identity: () => undefined }), /identity-unavailable/);
+  assert.throws(() => writeServiceProcessState({ ...options, commandLine: () => undefined }), /command-line-unavailable/);
+});
+
+test("ownership distinguishes absent, foreign, and unavailable process probes", () => {
+  const state = buildServiceProcessState({ pid: 4242, identity, commandLine, sourceRoot: root, stateDir });
+  const options = { commandLine, sourceRoot: root, stateDir };
+  for (const [probe, expected] of [
+    [() => ({ state: "alive", identity: identity() }), "owned"],
+    [() => ({ state: "alive", identity: "reused-pid" }), "foreign"],
+    [() => ({ state: "absent" }), "foreign"],
+    [() => ({ state: "unknown" }), "unknown"],
+    [() => undefined, "unknown"],
+    [() => { throw new Error("unavailable"); }, "unknown"],
+  ]) {
+    assert.equal(serviceProcessOwnership(state, { ...options, probe }), expected);
+    assert.equal(serviceProcessOwns(state, { ...options, probe }), expected === "owned");
+  }
+  assert.equal(serviceProcessOwnership(state, { ...options, identity: () => undefined }), "unknown");
+  assert.equal(serviceProcessOwnership(state, { ...options, identity: () => "different" }), "foreign");
+  assert.equal(serviceProcessOwnership(state, { ...options, identity, commandLine: () => undefined }), "unknown");
+  assert.equal(serviceProcessOwnership(state, { ...options, identity, commandLine: () => "different" }), "foreign");
+  assert.equal(serviceProcessOwnership({ ...state, sourceRoot: "other-checkout" }, {
+    ...options, probe: () => { throw new Error("must not be consulted"); },
+  }), "foreign");
+});
+
+test("only an answered foreign process and quiet port query settle a record", () => {
+  for (const ownership of ["owned", "foreign", "unknown", undefined]) {
+    for (const portListening of [true, false, undefined, null]) {
+      assert.equal(serviceRecordSettled({ ownership, portListening }), ownership === "foreign" && portListening === false);
+    }
+  }
+});
+
+test("strict lifecycle reads distinguish a missing record from corrupt state", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-strict-record-"));
+  try {
+    assert.equal(readServiceProcessState(path.join(directory, "absent.json"), { strict: true }), undefined);
+    assert.equal(readServiceProcessState(directory), undefined);
+    assert.throws(() => readServiceProcessState(directory, { strict: true }), /could not be read or validated/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 test("service process state requires the router start.mjs command line", () => {
   const state = buildServiceProcessState({
@@ -146,4 +202,86 @@ test("service process state is private, readable, and removable", () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("the VDI startup override does not widen runtime ownership probes", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-vdi-budget-"));
+  const name = "CODEX_ROUTER_WINDOWS_PROCESS_PROBE_TIMEOUT_MS";
+  const previous = process.env[name];
+  const seen = [];
+  const capture = (value) => (_pid, options) => {
+    seen.push(options.budget);
+    return value;
+  };
+  process.env[name] = "900000";
+  try {
+    const state = writeServiceProcessState({
+      pid: 4242,
+      platform: "win32",
+      identity: capture(identity()),
+      commandLine: capture(commandLine()),
+      sourceRoot: root,
+      stateDir,
+      statePath: path.join(directory, "service-process.json"),
+    });
+    assert.equal(seen.length, 2);
+    assert.ok(seen.every((budget) => budget.timeoutMs === 900_000 && budget.attempts === 2));
+    seen.length = 0;
+    assert.equal(serviceProcessOwns(state, {
+      platform: "win32",
+      identity: capture(identity()),
+      commandLine: capture(commandLine()),
+      sourceRoot: root,
+      stateDir,
+    }), true);
+    assert.deepEqual(seen, [undefined, undefined]);
+  } finally {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// `codex-router.ps1 start --foreground` enters through src/foreground-start.mjs,
+// whose command line never names src/start.mjs. While the foreground supervisor
+// still claimed this record it failed on every Windows install with a working
+// LiteLLM environment: "could not verify its own start.mjs process identity".
+// The one test that booted that entry stopped at its LiteLLM preflight, so no
+// test reached the claim from there; test/startup-cleanup.test.mjs now does.
+test("only the OS-service payload claims the Windows service-process record", () => {
+  assert.equal(shouldRecordServiceProcess({ platform: "win32", foreground: false }), true);
+  assert.equal(shouldRecordServiceProcess({ platform: "win32", foreground: true }), false);
+  assert.equal(shouldRecordServiceProcess({ platform: "darwin", foreground: false }), false);
+  assert.equal(shouldRecordServiceProcess({ platform: "linux", foreground: false }), false);
+  // The foreground command line cannot pass the entrypoint check, which is why
+  // the supervisor has to withdraw its claim rather than attempt it.
+  assert.equal(
+    buildServiceProcessState({
+      pid: 4242,
+      platform: "win32",
+      identity,
+      commandLine: () => `node "${root}/src/foreground-start.mjs"`,
+      sourceRoot: root,
+      stateDir,
+    }),
+    undefined,
+  );
+});
+
+test("marking the foreground supervisor withdraws its claim on the record", () => {
+  // The mark is module state, so observe it in a fresh process rather than
+  // leaking it into the other tests in this file.
+  const moduleUrl = new URL("../src/service-process.mjs", import.meta.url).href;
+  const script = [
+    `const service = await import(${JSON.stringify(moduleUrl)});`,
+    'const before = service.shouldRecordServiceProcess({ platform: "win32" });',
+    "service.markForegroundSupervisor();",
+    'const after = service.shouldRecordServiceProcess({ platform: "win32" });',
+    "process.stdout.write(JSON.stringify({ before, after }));",
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { before: true, after: false });
 });

@@ -25,6 +25,20 @@ Neither command prints credential values. Repair refuses unknown router owners.
 
 **Uninstall is never required** to see new OpenAI/Codex native models. While its merged catalog is installed, the router conditionally refreshes the signed-in account catalog itself, watches the resulting model fingerprint plus a lightweight fingerprint of the resolved Codex executable, and republishes when either source changes. A failed or unavailable account request leaves the prior cache untouched and falls back to that cache plus the bundled catalog. Discovery-disabled installs make no account request. Drift is checked on startup and periodically while the router stays running.
 
+The periodic check defaults to five minutes. To check once per day, set
+`CODEX_ROUTER_NATIVE_CATALOG_POLL_INTERVAL_MS=86400000`. Accepted values are
+integer milliseconds from `300000` to `2147483647`; invalid values retain the
+five-minute default. This changes only the periodic check: startup still checks
+immediately, the account-cache freshness TTL remains five minutes, and a manual
+`refresh-catalog` still forces a refresh. A longer interval can delay automatic
+discovery of account or executable changes until the next check.
+
+Pass the setting when installing the service; the macOS, Linux, and Windows
+renderers persist its normalized value. For an existing service, set it in the
+launchd environment, systemd environment, or Windows launcher and reload the
+service definition. A process restart alone does not reload a changed launchd
+property list. Restart the router after changing its environment.
+
 **Codex full quit/reopen is still required** to reload the catalog file. Codex reads `model_catalog_json` once at startup; the router cannot make Codex hot-reload.
 
 Expected flow:
@@ -483,6 +497,21 @@ attempt, its `upstream-terminal-failed=true` log line carries any
 provider-reported `input_tokens` and `output_tokens`; the router's usage row for
 that attempt has no token counts.
 
+Z.ai Coding Plan (`zai-coding`) reasoning streams have an independent three-minute
+idle deadline after the prologue is released. GLM can pause between reasoning
+events for more than thirty seconds, so applying the short prelude budget here
+can close a healthy turn before `response.completed`. Set
+`CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS` to an integer from `1` to `240000`
+milliseconds to override the `180000` default. Pass it when installing the
+service; the macOS, Linux, and Windows renderers persist the normalized value.
+For an existing service, set it in the launchd environment, systemd environment,
+or Windows launcher and reload that service definition; a process restart alone
+does not reload a changed launchd property list.
+Invalid values retain the default. This deadline stays below the shared transport
+and Codex client idle bounds; it adds no heartbeat. Headers-only responses retain
+the initial prelude budget, empty completions retain their guard, and a visible
+stream is never replayed. Grok's separate deadline and other routes are unchanged.
+
 Operators diagnosing an unusually slow upstream can temporarily change the
 30-second bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS` and the 1 MiB
 parser bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES`. These are
@@ -572,6 +601,29 @@ migrates only recognized earlier repository services and otherwise stops with a
 conflict.
 
 ## The background service is stopped
+
+Repeated automatic startup probe timeouts or unavailable Windows identity
+probes pause the next attempt for 1, 2, 4, 8, then at most 15 minutes. The service
+log says `backing off` and Windows may report `LastTaskResult=0x45` (exit 69).
+Configuration, credential, child-exit and mismatched-identity failures still
+need repair; the cooldown does not make them healthy.
+
+Use `node src/service.mjs start` or `node src/service.mjs restart` to reset the
+cooldown. A reset that fails reports an error before launching. A replacement
+also resets after the old service stops, so an old failure cannot hold it back.
+`bin/start --foreground` (Windows: `codex-router.ps1 start --foreground`) keeps
+its existing lifecycle lock and neither reads nor changes managed cooldown.
+
+To disable automatic cooldown persistently, set
+`CODEX_ROUTER_DISABLE_STARTUP_BACKOFF=1` when installing or regenerating the
+service definition; `0` restores it. Merely setting it in a shell before
+starting an already-installed service does not change that service's recorded
+environment. A direct payload run reads the shell setting; foreground startup
+always bypasses the cooldown.
+
+If an install reports that automatic startup is deferred, its service remains
+registered and the command returns temporary-failure status 75. Inspect the
+service log, resolve the startup problem, and use start or restart to reset it.
 
 macOS:
 

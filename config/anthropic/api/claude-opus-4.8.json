@@ -9,7 +9,7 @@
       "listed": true,
       "displayName": "Claude Opus 4.8 (API)",
       "description": "Claude Opus 4.8 through the separately billed Anthropic API for complex agentic coding.",
-      "priority": 9,
+      "priority": 13,
       "defaultEffort": "high",
       "reasoningLevels": [
         {

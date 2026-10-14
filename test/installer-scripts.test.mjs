@@ -592,7 +592,7 @@ test(
       const result = spawnSync("sh", ["-s"], {
         cwd: fixture,
         encoding: "utf8",
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH || ""}` },
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}` },
         input: `${posixVenvHelper()}\nensure_uv_venv\n`,
       });
       assert.equal(result.status, 0, result.stderr);
@@ -887,6 +887,21 @@ test("the skills step runs after the rollback trap is disarmed", () => {
   assert.notEqual(trapDisarmed, -1, "bin/install must disarm the rollback trap");
   assert.notEqual(skillsStep, -1, "bin/install must call the skills step");
   assert.ok(trapDisarmed < skillsStep, "skills step must run after the trap is disarmed");
+});
+
+test("a failed skill refresh does not fail the POSIX install", { skip: !POSIX_SHELL_AVAILABLE }, () => {
+  const source = readScript("bin", "install");
+  const start = source.indexOf('if [ "$target" = codex ]; then', source.indexOf("# The skill pack"));
+  const end = source.indexOf("\nfi\n", start);
+  assert.ok(start >= 0 && end > start, "bin/install must keep the Codex skills step");
+  const skillsStep = source.slice(start, end + 4);
+  const result = spawnSync("sh", ["-eu", "-c", `target=codex
+node() { return 2; }
+${skillsStep}
+printf 'continued\\n'`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /continued/);
+  assert.match(result.stderr, /skills could not be refreshed/);
 });
 
 test("uninstall removes the managed skills", () => {

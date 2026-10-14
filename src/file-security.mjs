@@ -12,6 +12,8 @@ import {
 } from "node:fs";
 import path from "node:path";
 
+import { startupTimeoutMs } from "./startup-timeout.mjs";
+
 const WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS = 30_000;
 const WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT = 64 * 1024;
 
@@ -173,7 +175,10 @@ function protectPrivateFilesWin32(paths) {
       {
         env: windowsPowerShellEnvironment(list),
         stdio: ["ignore", "ignore", "pipe"],
-        timeout: 15_000,
+        // Slow hosts (VDI Task Scheduler ancestry) need a wider bound for
+        // the helper's cold start; the default is unchanged. The async
+        // request path keeps its own bound below.
+        timeout: startupTimeoutMs("CODEX_ROUTER_WINDOWS_PRIVATE_SYNC_TIMEOUT_MS", 15_000),
         // Every private write reaches this helper, including the ones a
         // Control Center status refresh performs. A console child of a GUI
         // parent gets its own window unless this is set, which is how a

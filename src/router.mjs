@@ -1,3 +1,4 @@
+import { resolveGenerationOutcome } from "./response-outcome.mjs";
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
@@ -41,8 +42,10 @@ import {
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
   MAX_BUFFERED_RESPONSE_BYTES,
+  MAX_BODY_BYTES,
   httpErrorStatus,
   installGracefulShutdown,
+  markResponsesStream,
   pipeResponse,
   readResponseBody,
   readRequestBody,
@@ -80,6 +83,8 @@ import {
 } from "./grok-tool-facade.mjs";
 import { applyGrokFileToolsOverlay } from "./instruction-overlays.mjs";
 import { ResponsesHeartbeatTransform } from "./responses-heartbeat.mjs";
+import { responsesStreamFailureTransform } from "./responses-stream-failure.mjs";
+import { glmRepetitionGuardTransform, REPETITIVE_GENERATION_CODE } from "./glm-repetition-guard.mjs";
 import { messagePhaseTransform } from "./message-phase.mjs";
 import { translatedToolMessageCompatTransform } from "./deepseek-tool-message-compat.mjs";
 import {
@@ -95,6 +100,7 @@ import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
   PORTS,
+  TARGET,
   loopback,
 } from "./paths.mjs";
 import {
@@ -104,6 +110,17 @@ import {
   providerForModel,
 } from "./model-registry.mjs";
 import { isProviderPrefixedSlug, unroutedModelError } from "./unrouted-model.mjs";
+import {
+  WsUpgradeRefusedError,
+  RESPONSES_WEBSOCKET_BETA,
+  collectResponsesRequest,
+  markWsTransportFailure,
+  nativeWebSocketTransportEnabled,
+  responsesWebSocketTransportUsable,
+  responsesWebSocketUrl,
+  wsTransportAvailable,
+} from "./responses-ws-client.mjs";
+import { providerPoolRegistry } from "./provider-ws-pool.mjs";
 import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
@@ -185,7 +202,7 @@ import {
   GroqToolLimitError,
   GROQ_TOOL_LIMIT_CODE,
 } from "./chat-tool-surface.mjs";
-import { collaborationToolAvailable, pendingInterruptTargets } from "./subagent-completion.mjs";
+import { pendingInterruptPlan, subagentToolAvailable } from "./subagent-completion.mjs";
 import {
   FAILOVER_BUDGET_MS,
   MAX_FAILOVER_HOPS,
@@ -234,6 +251,10 @@ import {
   supportsOpenAIModelEndpoint,
 } from "./openai-endpoint-policy.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
+import {
+  assertGoalContinuationProgress,
+  GoalContinuationNoProgressError,
+} from "./goal-continuation-guard.mjs";
 import { createRequestProgress } from "./request-progress.mjs";
 import {
   grokOauthIngressContextBytes,
@@ -261,6 +282,7 @@ import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { ageToolResults } from "./tool-result-aging.mjs";
+import { MAX_IMAGE_HISTORY_BYTES, readResponsesRequest } from "./responses-request-body.mjs";
 import {
   IMAGE_REJECTION_MAX_RETRIES,
   boundImagePayload,
@@ -288,6 +310,8 @@ import {
   loopbackProbeFetch,
 } from "./fetch-transport.mjs";
 import { grokStreamStallMs, grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
+import { zaiCodingStreamStallMs } from "./zai-stream-timeouts.mjs";
+import { localTransportIdleTimeoutMs } from "./local-timeouts.mjs";
 import { handleResponsesWebSocketUpgrade } from "./responses-websocket.mjs";
 
 installStableFetchTransport();
@@ -404,6 +428,8 @@ const STREAM_STALL_MS =
 // Every transport hop on the Grok path is sized from the same value.
 const GROK_STREAM_STALL_MS = grokStreamStallMs();
 const GROK_TRANSPORT_IDLE_TIMEOUT_MS = grokTransportIdleTimeoutMs();
+const ZAI_CODING_STREAM_STALL_MS = zaiCodingStreamStallMs();
+const LOCAL_TRANSPORT_IDLE_TIMEOUT_MS = localTransportIdleTimeoutMs();
 // Codex abandons a stream after five minutes without a data event and sends
 // the turn again. A silent Grok stream relays a lifecycle heartbeat well inside
 // that window; see src/responses-heartbeat.mjs.
@@ -421,12 +447,16 @@ function isGrokOauthRoute(route) {
   return Boolean(route) && canonicalProviderId(route.provider) === "grok-oauth";
 }
 
-// A Grok hop uses a pool whose body idle bound outlasts the stall guard. Every
-// other route keeps the shared pool and Undici's default bound.
+// Grok keeps its stall-guard-sized pool. Local Ollama uses a separate pool
+// whose headers and body idle bounds outlast its LiteLLM timeout.
 function fetchForRoute(route, url, init) {
-  return isGrokOauthRoute(route)
-    ? longIdleStreamFetch(url, init, { bodyTimeoutMs: GROK_TRANSPORT_IDLE_TIMEOUT_MS })
-    : fetch(url, init);
+  if (isGrokOauthRoute(route)) {
+    return longIdleStreamFetch(url, init, { bodyTimeoutMs: GROK_TRANSPORT_IDLE_TIMEOUT_MS });
+  }
+  if (route && canonicalProviderId(route.provider) === "local") {
+    return longIdleStreamFetch(url, init, { bodyTimeoutMs: LOCAL_TRANSPORT_IDLE_TIMEOUT_MS });
+  }
+  return fetch(url, init);
 }
 
 // Codex sends the service tier the operator picked, and a priority tier bills
@@ -470,6 +500,15 @@ const MAX_DECODED_BODY_BYTES =
   Number.isFinite(configuredDecodedBodyBytes) && configuredDecodedBodyBytes > 0
     ? Math.floor(configuredDecodedBodyBytes)
     : 256 * 1024 * 1024;
+// The streaming history allowance is for the default visual-session path.
+// Explicit wire/decoded caps retain their meaning at ingress and every decoder.
+const explicitBodyLimit = process.env.MODEL_ROUTER_MAX_BODY_BYTES ||
+  (TARGET === "codex" && (process.env.CODEX_ROUTER_MAX_BODY_BYTES || process.env.KIMI_PROXY_MAX_BODY_BYTES));
+const INCOMING_HISTORY_WIRE_BYTES = explicitBodyLimit
+  ? positiveByteLimit(MAX_BODY_BYTES, 128 * 1024 * 1024) : MAX_IMAGE_HISTORY_BYTES;
+const INCOMING_HISTORY_DECODED_BYTES =
+  process.env.MODEL_ROUTER_MAX_DECODED_BODY_BYTES || process.env.CODEX_ROUTER_MAX_DECODED_BODY_BYTES
+    ? MAX_DECODED_BODY_BYTES : MAX_IMAGE_HISTORY_BYTES;
 const configuredActiveRequests = Number(
   process.env.MODEL_ROUTER_MAX_ACTIVE_REQUESTS ||
     process.env.CODEX_ROUTER_MAX_ACTIVE_REQUESTS ||
@@ -631,10 +670,10 @@ function beginRequestActivity({ request, response, controller } = {}) {
   let finished = false;
   let deadlineExceeded = false;
   let executionTimer;
-  const finish = (status) => {
+  const finish = (status, outcome) => {
     if (finished) return;
     finished = true;
-    progress.finish(status);
+    progress.finish(status, outcome);
     if (executionTimer) clearTimeout(executionTimer);
     activityRecords.delete(requestId);
     inFlightRequests.delete(requestId);
@@ -1037,8 +1076,79 @@ function routedHeaders() {
 // DeepSeek's current model already speaks Codex's wire protocol. The shared
 // API forwarder still owns credentials and upstream transport; bypass only
 // LiteLLM, whose unknown-model fallback simulates native Responses streaming.
+function usesProviderResponsesWebSocket(route) {
+  const provider = providerForModel(route);
+  return provider?.generic === true && provider?.transport === "websocket" &&
+    (route.endpoint?.protocol ?? provider.protocol) === "openai-responses";
+}
+
+// The native upstream leg over the Responses WebSocket protocol. Native turns
+// are stateless full conversations either way (Codex re-sends the body on
+// HTTP, and this transport carries it as one frame), so the win here is the
+// persistent connection -- no per-turn TLS handshake -- not a smaller body.
+// Opt-in, with fallback only before a generation frame has been sent.
+const NATIVE_WS_BREAKER_KEY = "native-responses-ws";
+const nativeWsPools = providerPoolRegistry({
+  resolveProvider: (_providerId, target) => ({ wsTarget: () => target }),
+});
+
+function nativeWebSocketTransportSelected() {
+  return (
+    nativeWebSocketTransportEnabled() &&
+    responsesWebSocketTransportUsable() &&
+    wsTransportAvailable(NATIVE_WS_BREAKER_KEY)
+  );
+}
+
+async function nativeResponsesWebSocketFetch(url, init, { fallbackFetch, onSent, onHeaders }) {
+  const httpFallback = async () => {
+    const headers = { ...init.headers };
+    const body = await compressedNativeBody(init.body, headers);
+    return fallbackFetch(url, { ...init, headers, body });
+  };
+  let payload;
+  try { payload = JSON.parse(init.body.toString("utf8")); } catch { return httpFallback(); }
+  if (payload?.stream !== true || !Array.isArray(payload.input) || payload.previous_response_id) return httpFallback();
+  // Every forwarded identity participates in pool affinity. A turn-specific
+  // header cannot be replayed from a different request's frozen handshake.
+  const headers = Object.fromEntries(Object.entries(init.headers).filter(([name]) => FORWARD_HEADERS.has(name.toLowerCase())));
+  const beta = String(headers["openai-beta"] || "");
+  headers["openai-beta"] = [...new Set([...beta.split(",").map((token) => token.trim()).filter(Boolean), RESPONSES_WEBSOCKET_BETA])].join(", ");
+  let lease;
+  try {
+    const pool = await nativeWsPools.poolFor("native", { url: responsesWebSocketUrl(url), headers });
+    lease = await pool.acquire(init.signal);
+  } catch (error) {
+    if (init.signal?.aborted) throw error;
+    markWsTransportFailure(NATIVE_WS_BREAKER_KEY);
+    console.error("[codex-router] native websocket transport unavailable%s; using HTTP",
+      error instanceof WsUpgradeRefusedError && error.status !== undefined ? ` upgrade_status=${error.status}` : "");
+    return httpFallback();
+  }
+  onSent();
+  try {
+    const result = await collectResponsesRequest(lease.connection, payload, {
+      signal: init.signal,
+      onSettled: () => lease.release(),
+    });
+    onHeaders();
+    return result;
+  } catch (error) {
+    lease.connection.abort();
+    lease.release();
+    throw error;
+  }
+}
+
 function routedResponsesTarget(route) {
-  return `${usesDeepSeekResponses(route) ? API_BASE : GATEWAY_BASE}/responses`;
+  // WebSocket-transport providers terminate at the api-forwarder directly,
+  // exactly like DeepSeek Responses: LiteLLM has no WebSocket leg, and the
+  // forwarder owns both the credential boundary and the pooled upstream
+  // connections. Their litellm.yaml entries stay but go unused.
+  if (usesDeepSeekResponses(route) || usesProviderResponsesWebSocket(route)) {
+    return `${API_BASE}/responses`;
+  }
+  return `${GATEWAY_BASE}/responses`;
 }
 
 // LiteLLM translates Codex Responses requests into Chat Completions only after
@@ -1242,6 +1352,20 @@ function consoleGoCompatibleInput(input, route) {
     providerForModel(route)?.id !== "opencode-go-responses" ||
     !CONSOLE_GO_COLLABORATION_UPSTREAMS.has(route?.upstreamModel)
   ) {
+    return input;
+  }
+  return agentMessagesAsUserMessages(input);
+}
+
+// `agent_message` is a Codex-internal collaboration item, not part of the
+// public Responses schema a user-registered compatible endpoint implements.
+// Its readable payload has already been recovered by normalizeRoutedAgentInput;
+// preserve that content as an ordinary user message at this generic boundary.
+// Built-in providers keep their measured contracts and existing compatibility
+// gates above.
+function genericResponsesCompatibleInput(input, route) {
+  const provider = providerForModel(route);
+  if (provider?.generic !== true || provider.protocol !== "openai-responses") {
     return input;
   }
   return agentMessagesAsUserMessages(input);
@@ -1488,14 +1612,10 @@ function writeEmptyCompletionError(response, code, message) {
   });
 }
 
-// Codex treats a streamed Responses `error` event as terminal, but can keep a
-// Grok OAuth turn open while its HTTP client retries a bare gateway 5xx. The
-// local Grok gateway has already exhausted its bounded retries by the time this
-// branch runs, so a second retry loop in the client only turns a stated outage
-// into a stale Working badge. Preserve every other provider's existing HTTP
-// contract, plus ordinary JSON errors for non-streaming Grok calls and its
-// actionable 4xx responses; only the observed terminal Grok shape crosses the
-// Responses SSE boundary this way.
+// State a terminal Grok gateway outage on its existing streaming surface.
+// The gateway has already exhausted its bounded retries; client stream retries
+// still follow that client's policy. Preserve every other provider's HTTP
+// contract, plus JSON errors for non-streaming Grok calls and actionable 4xx.
 function writeTranslatedGatewayError(
   response,
   status,
@@ -3016,9 +3136,12 @@ async function summarizeWith(
   signal,
   { searchContract } = {},
 ) {
-  const compatibleInput = consoleGoCompatibleInput(
-    zenFreeCompatibleInput(
-      normalizeProviderAppToolOutputs(aged.input),
+  const compatibleInput = genericResponsesCompatibleInput(
+    consoleGoCompatibleInput(
+      zenFreeCompatibleInput(
+        normalizeProviderAppToolOutputs(aged.input),
+        route,
+      ),
       route,
     ),
     route,
@@ -3461,6 +3584,7 @@ async function handleRoutedCompaction(
       status: result.status,
       bodyText,
       modelName: servedRoute.displayName || servedRoute.slug,
+      providerId: servedRoute.provider,
       providerName:
         provider?.transport === "ollama"
           ? "Ollama"
@@ -3668,9 +3792,12 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   const clientTools = chatCompletionsProvider || deepSeekResponses || consoleGoResponsesCompatibility
     ? restorePreflattenedToolNamespaces(payload.tools, payload.client_metadata)
     : payload.tools;
-  const compatibleInput = consoleGoCompatibleInput(
-    zenFreeCompatibleInput(
-      normalizeProviderAppToolOutputs(agedInput),
+  const compatibleInput = genericResponsesCompatibleInput(
+    consoleGoCompatibleInput(
+      zenFreeCompatibleInput(
+        normalizeProviderAppToolOutputs(agedInput),
+        route,
+      ),
       route,
     ),
     route,
@@ -3876,7 +4003,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
               recoverWithoutRelay: true,
               toolChoice: routedToolChoice,
             }
-          : undefined,
+          // Every provider still needs the forced choice: it can name a
+          // withheld deferred tool, and only the relay can put that
+          // definition back before the request leaves.
+          : { toolChoice: routedToolChoice },
       );
     } catch (error) {
       if (provider?.id !== "groq" || !(error instanceof ToolSearchHistoryCapacityError)) {
@@ -3901,6 +4031,13 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
       // Stored tool-search results can introduce definitions after the first
       // repair pass, so enforce the same boundary on the expanded inventory.
       tools = repairToolSchemaRoots(tools, { nonRecursive: true });
+    }
+    if (needsMoonshotSchemaCompatibility(route)) {
+      // For the same reason: a discovered definition, or one restored because
+      // the transcript already called it, arrives after the repair above and
+      // would otherwise reach Moonshot's validator with the sibling `$ref` it
+      // rejects the whole request over.
+      tools = repairToolSchemaRoots(tools, { inlineForeignRefs: true, declareTypes: true });
     }
   }
   if (needsCommandCodeGeminiToolSchemaCompatibility(route)) {
@@ -4036,6 +4173,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     providerToolCount: Array.isArray(routed.tools) ? routed.tools.length : 0,
     providerToolSchemaBytes: utf8JsonBytes(routed.tools),
   };
+  const interruptPlan = pendingInterruptPlan(
+    needsZenFreeToolCompatibility(route) ? agedInput : input,
+    { namespaces: flattenedNamespaces },
+  );
   return {
     body: Buffer.from(JSON.stringify(routed), "utf8"),
     usageDiagnostics,
@@ -4055,14 +4196,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
           ...(patchHook ? { mode: "client_hook" } : {}),
         }
       : undefined,
-    // Close finished children the parent left Working. Only when the
-    // collaboration toolset is actually available on this turn.
-    pendingInterrupts: pendingInterruptTargets(
-      needsZenFreeToolCompatibility(route) ? agedInput : input,
-      {
-        namespaces: flattenedNamespaces,
-      },
-    ),
+    // Close finished children the parent left Working, but only when this
+    // request identifies one unambiguous subagent lifecycle namespace.
+    pendingInterrupts: interruptPlan.targets,
+    pendingInterruptNamespace: interruptPlan.namespace,
   };
 }
 
@@ -4130,6 +4267,7 @@ function prepareProviderInput(
   });
   const bounded = boundImagePayload(aged.input, {
     ...imageLimits,
+    protectPending: true,
     tokensPerImage: maxImageTokensForRoute(route),
   });
   return {
@@ -4167,9 +4305,8 @@ function failoverCandidates({ route, agedInput, flattenedNamespaces, searchContr
       // its smaller window.
       needsImage: inputHasImage(agedInput),
       // Only a turn that can actually spawn children needs a model that has
-      // been through the collaboration proof. A child answering its own turn
-      // does not.
-      needsMultiAgentV2: collaborationToolAvailable(flattenedNamespaces),
+      // passed the multi-agent v2 proof. A child answering its own turn does not.
+      needsMultiAgentV2: subagentToolAvailable(flattenedNamespaces),
       needsSearch: searchContract.needsSearch,
       hasSearchHistory: searchContract.hasSearchHistory,
       requiredSearchMode: searchContract.requiredMode,
@@ -4391,6 +4528,7 @@ function writeIdleNoProviderError(response) {
 }
 
 async function handleResponses(request, response, requestUrl) {
+  markResponsesStream(response);
   const startedAt = Date.now();
   const controller = new AbortController();
   const activity = beginRequestActivity({ request, response, controller });
@@ -4420,6 +4558,7 @@ async function handleResponses(request, response, requestUrl) {
   let conversationWindow;
   let imageBudget;
   let pendingInterrupts = [];
+  let pendingInterruptNamespace;
   let bufferNativeStream = false;
   let emptyCompletion = false;
   let emptyCompletionRetried = false;
@@ -4440,6 +4579,23 @@ async function handleResponses(request, response, requestUrl) {
   let finalStatus;
   let activityStatus;
   let usageRecorded = false;
+  let generationOutcome;
+  let turnHttpStatus;
+  const recordTurnUsage = (fields, metadata) => {
+    const observer = retryUsageTransform ?? usageTransform;
+    generationOutcome = resolveGenerationOutcome({
+      observed: observer?.generationOutcome(),
+      status: fields.status,
+      canceled: fields.status === 0,
+      failed: fields.streamAborted || fields.emptyCompletion ||
+        fields.emptyCompletionUnrepairable || fields.requestDeadlineExceeded,
+      expectsTerminal: !!observer,
+    });
+    // The HTTP envelope remains committed even when a later SSE terminal fails.
+    turnHttpStatus = response.headersSent ? response.statusCode :
+      fields.status >= 100 ? fields.status : upstreamStatus;
+    recordObservedUsage({ ...fields, httpStatus: turnHttpStatus, generationOutcome }, metadata);
+  };
   bindClientAbort(request, response, () => {
     clientGone = true;
     activity.progress.cancel("client_disconnected");
@@ -4449,11 +4605,21 @@ async function handleResponses(request, response, requestUrl) {
     if (!requireCodexTransport(request, response)) return;
     const exactRouteProbe = exactRouteProbeRequested(request.headers);
     const canonicalReplay = canonicalReplayRequested(request.headers);
-    const encoded = await readRequestBody(request, { signal: controller.signal });
-    const body = await decodeBody(encoded, request.headers["content-encoding"]);
-    let payload = await parseBodyAsync(body);
+    const contentEncoding = String(request.headers["content-encoding"] || "");
+    const compressed = contentEncoding.split(",").some((value) => value.trim() && value.trim().toLowerCase() !== "identity");
+    const received = await readResponsesRequest(request, {
+      signal: controller.signal,
+      maxBytes: compressed ? MAX_DECODED_BODY_BYTES : MAX_BODY_BYTES,
+      maxWireBytes: INCOMING_HISTORY_WIRE_BYTES,
+      maxHistoryBytes: INCOMING_HISTORY_DECODED_BYTES,
+    });
+    let payload = received.payload;
+    if (received.stats.imagesDropped > 0) {
+      console.error(`[codex-router] bounded incoming image history dropped=${received.stats.imagesDropped} image-bytes-saved=${received.stats.imageBytesSaved} decoded-bytes=${received.stats.decodedBytes}`);
+    }
     controller.signal.throwIfAborted();
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    markResponsesStream(response, { model: requestedModel });
     let registeredRoute =
       MODEL_BY_SLUG.get(requestedModel) ??
       MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
@@ -4515,7 +4681,7 @@ async function handleResponses(request, response, requestUrl) {
             invalidHistoryCall.toolName || "unknown"
           } ${invalidHistoryCall.param || ""} status=400`,
         );
-        recordObservedUsage({
+        recordTurnUsage({
           model: route.slug,
           provider: canonicalProviderId(route.provider),
           status: 400,
@@ -4558,6 +4724,11 @@ async function handleResponses(request, response, requestUrl) {
     // terminal trigger. Detect the protocol shape before route dispatch so the
     // native path can also preserve the full tool results being summarized.
     const compactV2 = isRemoteCompactV2Trigger(payload);
+    // Gate generation only, before conversion or any provider request.
+    // Compaction summarizes existing history rather than continuing a goal.
+    if (route?.goalContinuationGuard === true && !compactV1 && !compactV2) {
+      assertGoalContinuationProgress(payload.input);
+    }
 
     // The same normalization the routed compaction path would do, hoisted so
     // the budget is judged on the bytes that actually go upstream and so the
@@ -4586,7 +4757,7 @@ async function handleResponses(request, response, requestUrl) {
           `[codex-router] skipped-unnecessary-compaction model=${route.slug} provider=${route.provider} estimated-input=${skipEstimatedTokens}`,
         );
       }
-      recordObservedUsage(
+      recordTurnUsage(
         {
           model: route.slug,
           provider: canonicalProviderId(route.provider),
@@ -4637,6 +4808,8 @@ async function handleResponses(request, response, requestUrl) {
     let target;
     let headers;
     let routedBody;
+    let nativeWsTransport = false;
+    let nativeWsSent = false;
     let builtSearchMode;
     let namespacesFlattened = false;
     let flattenedNamespaces = new Map();
@@ -4666,6 +4839,7 @@ async function handleResponses(request, response, requestUrl) {
       diagnostics.grokStructuredPatch = built.grokStructuredPatch;
       setRoutingDiagnostics(built);
       pendingInterrupts = built.pendingInterrupts;
+      pendingInterruptNamespace = built.pendingInterruptNamespace;
       agedInput = built.agedInput;
       toolResultAging = built.toolResultAging;
       conversationWindow = built.conversationWindow;
@@ -4721,6 +4895,7 @@ async function handleResponses(request, response, requestUrl) {
       diagnostics.grokStructuredPatch = built.grokStructuredPatch;
       setRoutingDiagnostics(built);
       pendingInterrupts = built.pendingInterrupts;
+      pendingInterruptNamespace = built.pendingInterruptNamespace;
       target = built.target;
       headers = built.headers;
       routedBody = built.body;
@@ -4848,9 +5023,11 @@ async function handleResponses(request, response, requestUrl) {
       flattenedNamespaces = flattenNamespaceTools(payload.tools, {
         bridgeToolSearch: false,
       }).namespaces;
-      pendingInterrupts = pendingInterruptTargets(native.input ?? payload.input, {
+      const interruptPlan = pendingInterruptPlan(native.input ?? payload.input, {
         namespaces: flattenedNamespaces,
       });
+      pendingInterrupts = interruptPlan.targets;
+      pendingInterruptNamespace = interruptPlan.namespace;
       if (!compactV1) delete native.previous_response_id;
       if (substitutedCaller) {
         normalizeNativeForSubstitutedCaller(native, { compact: compactV1 });
@@ -4863,12 +5040,19 @@ async function handleResponses(request, response, requestUrl) {
           bufferNativeStream = true;
         }
       }
+      nativeWsTransport = !compactV1 && !compactV2 && nativeWebSocketTransportSelected();
       target = nativeTarget(requestUrl.pathname);
       headers = nativeHeaders(request);
-      routedBody = await compressedNativeBody(
-        Buffer.from(JSON.stringify(native), "utf8"),
-        headers,
-      );
+      // The native WebSocket transport speaks JSON frames, never a zstd
+      // Content-Encoding, so its turns keep the plain replayable body.
+      if (nativeWsTransport) {
+        routedBody = Buffer.from(JSON.stringify(native), "utf8");
+      } else {
+        routedBody = await compressedNativeBody(
+          Buffer.from(JSON.stringify(native), "utf8"),
+          headers,
+        );
+      }
     }
 
     // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
@@ -4896,9 +5080,15 @@ async function handleResponses(request, response, requestUrl) {
         // Routed traffic terminates at the local gateway, which has its own
         // error translation and Retry-After handling below; leave it exactly
         // as it was.
-        fetchImpl: fetchObservedUpstream,
+        fetchImpl: nativeWsTransport
+          ? (url, init) => nativeResponsesWebSocketFetch(url, init, {
+              fallbackFetch: fetchObservedUpstream,
+              onSent: () => { nativeWsSent = true; activity.progress.attempt(); },
+              onHeaders: () => activity.progress.headers(),
+            })
+          : fetchObservedUpstream,
         retries: route ? 0 : undefined,
-        canRetry: () => nothingRelayed(response),
+        canRetry: () => !nativeWsSent && nothingRelayed(response),
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
     );
@@ -5040,7 +5230,7 @@ async function handleResponses(request, response, requestUrl) {
           // cost the provider something, so it is metered on its own row. The
           // serving row below carries `failoverFrom`, which is what makes a
           // rescued turn distinguishable from one that never failed.
-          recordObservedUsage({
+          recordTurnUsage({
             model: route.slug,
             provider: canonicalProviderId(route.provider),
             status: upstream.status,
@@ -5115,6 +5305,7 @@ async function handleResponses(request, response, requestUrl) {
         // second `.text()` on the same response yields "".
         bodyText: failedBodyText ?? "",
         modelName: route.displayName || route.slug,
+        providerId: route.provider,
         providerName:
           provider?.transport === "ollama"
             ? "Ollama"
@@ -5127,7 +5318,7 @@ async function handleResponses(request, response, requestUrl) {
         provider: route.provider,
         stream: payload.stream === true,
       });
-      recordObservedUsage({
+      recordTurnUsage({
         model: route.slug,
         provider: canonicalProviderId(route.provider),
         status: upstream.status,
@@ -5247,7 +5438,12 @@ async function handleResponses(request, response, requestUrl) {
             route?.slug,
             // A native stream is attached only for the injection, so it must
             // not pick up the routed-provider rewrites on the way through.
-            { pendingInterrupts, injectOnly: !route, effortForModel: subagentEffort },
+            {
+              pendingInterrupts,
+              interruptNamespace: pendingInterruptNamespace,
+              injectOnly: !route,
+              effortForModel: subagentEffort,
+            },
           ),
         );
       }
@@ -5260,6 +5456,8 @@ async function handleResponses(request, response, requestUrl) {
         ? invalidCompletedFunctionCallTransform(flattenedNamespaces, contentType)
         : undefined;
       if (invalidFunctionCall) transforms.push(invalidFunctionCall);
+      const repetitionGuard = glmRepetitionGuardTransform(route, contentType);
+      if (repetitionGuard) transforms.push(repetitionGuard);
       const guard =
         route && EMPTY_COMPLETION_RETRY
           ? new EmptyCompletionGuard(contentType, {
@@ -5267,7 +5465,9 @@ async function handleResponses(request, response, requestUrl) {
               maxPreludeMs: preludeMs,
               maxStreamStallMs: canonicalProviderId(route.provider) === "grok-oauth"
                 ? GROK_STREAM_STALL_MS
-                : STREAM_STALL_MS,
+                : canonicalProviderId(route.provider) === "zai-coding"
+                  ? ZAI_CODING_STREAM_STALL_MS
+                  : STREAM_STALL_MS,
             })
           : undefined;
       if (guard) {
@@ -5312,14 +5512,18 @@ async function handleResponses(request, response, requestUrl) {
       // always wins. Native streams already carry the label and gain no stage.
       const messagePhase = route ? messagePhaseTransform(contentType) : undefined;
       if (messagePhase) transforms.push(messagePhase);
-      // Last, so no router stage ever parses a heartbeat: while a Grok stream is
-      // silent, keep the client's idle timer from abandoning a live turn.
+      // After the content rewrites, so they never consume a heartbeat: while
+      // Grok is silent, keep the client's idle timer from abandoning a live turn.
       if (
         isGrokOauthRoute(route) &&
         String(contentType).toLowerCase().includes("text/event-stream")
       ) {
         transforms.push(new ResponsesHeartbeatTransform({ intervalMs: GROK_HEARTBEAT_MS }));
       }
+      // Observe the exact egress after every rewrite, hold, and heartbeat. A
+      // discarded attempt never announces its identity to this observer.
+      const failureMetadata = responsesStreamFailureTransform(response, contentType);
+      if (failureMetadata) transforms.push(failureMetadata);
       return { transforms, usageObserver, guard, leakedToolCalls };
     };
     // The guard's pre-content budget scales with this request's size: a large
@@ -5328,7 +5532,7 @@ async function handleResponses(request, response, requestUrl) {
     // on a ~577k-token turn).
     const requestPreludeMs = preludeBudgetMs({
       baseMs: EMPTY_COMPLETION_PRELUDE_MS,
-      requestBytes: typeof body?.length === "number" ? body.length : 0,
+      requestBytes: received.stats.retainedBodyBytes,
     });
     const firstPipeline = createResponsePipeline(upstreamContentType, requestPreludeMs);
     usageTransform = firstPipeline.usageObserver;
@@ -5437,6 +5641,18 @@ async function handleResponses(request, response, requestUrl) {
           ? "The model produced no output before the router's safety limit and then completed without output. The response had already started, so the router could not retry it safely."
           : "The model streamed reasoning but produced no output. The router could not retry because the response had already started.",
       });
+      finalStatus = 502;
+    } else if (
+      (emptyCompletion || preludeLimitRetryable || invalidFunctionCallRetryable) &&
+      (nativeWsSent || (route && usesProviderResponsesWebSocket(route)))
+    ) {
+      // The provider may still be generating after a local parser deadline.
+      // shortcut: WS-configured generic routes also skip repair on HTTP fallback;
+      // carry a trusted per-attempt marker if that distinction becomes necessary.
+      emptyCompletionUnrepairable = true;
+      clearStagedResponseHead(response);
+      writeEmptyCompletionError(response, "websocket_turn_not_replayed",
+        "The upstream turn ended without usable output. It was not replayed because generation may already have started.");
       finalStatus = 502;
     } else if (emptyCompletion || preludeLimitRetryable || invalidFunctionCallRetryable) {
       // The upstream answered 200 with nothing and never proved otherwise, so
@@ -5635,7 +5851,7 @@ async function handleResponses(request, response, requestUrl) {
     // is already gone) and only rejects for an upstream that actually failed.
     // A cancel is not a router failure, so it meters as 0 rather than the
     // committed 200 that the client never finished reading.
-    recordObservedUsage({
+    recordTurnUsage({
       model: route?.slug || requestedModel,
       provider: route ? canonicalProviderId(route.provider) : "openai",
       status: finalStatus,
@@ -5665,7 +5881,8 @@ async function handleResponses(request, response, requestUrl) {
     // The same usage this turn just metered, and the same two disqualifiers
     // context-window-drift.mjs applies to it: a substituted estimate and a
     // retry-doubled count are not measurements of what the child sent.
-    observeSubagentOutcome(request, route, finalStatus, {
+    observeSubagentOutcome(request, route,
+      generationOutcome === "completed" ? finalStatus : finalStatus === 0 ? 0 : 502, {
       emptyCompletion,
       usage,
       estimatedInputTokens,
@@ -5704,12 +5921,13 @@ async function handleResponses(request, response, requestUrl) {
       );
     }
   } catch (error) {
-    upstreamLatencyMs ??= Date.now() - startedAt;
+    // A local goal refusal has no upstream response latency to meter.
+    if (!(error instanceof GoalContinuationNoProgressError)) upstreamLatencyMs ??= Date.now() - startedAt;
     if (activity.deadlineExceeded()) {
       finalStatus = 504;
       activityStatus = 504;
       if (!usageRecorded) {
-        recordObservedUsage({
+        recordTurnUsage({
           model: route?.slug || requestedModel,
           provider: route ? canonicalProviderId(route.provider) : "openai",
           status: 504,
@@ -5747,7 +5965,7 @@ async function handleResponses(request, response, requestUrl) {
           param: error.param ?? null,
         },
       });
-      recordObservedUsage({
+      recordTurnUsage({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: finalStatus,
@@ -5767,7 +5985,7 @@ async function handleResponses(request, response, requestUrl) {
         message: error.message,
       });
       if (!response.writableEnded && !response.destroyed) response.end();
-      recordObservedUsage({
+      recordTurnUsage({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: 502,
@@ -5794,7 +6012,7 @@ async function handleResponses(request, response, requestUrl) {
           message: error.message,
         },
       });
-      recordObservedUsage({
+      recordTurnUsage({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: error.status,
@@ -5813,7 +6031,7 @@ async function handleResponses(request, response, requestUrl) {
           message: error.message,
         },
       });
-      recordObservedUsage({
+      recordTurnUsage({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: error.status,
@@ -5847,13 +6065,48 @@ async function handleResponses(request, response, requestUrl) {
       if (firstTokenAt !== undefined) firstTokenMs = firstTokenAt - startedAt;
       reasoningStreamed = usageTransform.reasoningStreamed?.();
     }
+    if (error?.code === REPETITIVE_GENERATION_CODE) {
+      const tokenTimes = [usageTransform?.firstTokenAt?.(), retryUsageTransform?.firstTokenAt?.()]
+        .filter((value) => value !== undefined);
+      if (tokenTimes.length) firstTokenMs = Math.min(...tokenTimes) - startedAt;
+      reasoningStreamed = usageTransform?.reasoningStreamed?.() || retryUsageTransform?.reasoningStreamed?.();
+      const streamed = response.headersSent;
+      finalStatus = streamed ? 502 : 400;
+      activityStatus = finalStatus;
+      if (streamed) {
+        writeStreamErrorEvent(response, { code: error.code, message: error.message, localRejection: true });
+        if (!response.writableEnded && !response.destroyed) response.end();
+      } else {
+        clearStagedResponseHead(response);
+        writeJson(response, 400, { error: { type: "generation_guard_error", code: error.code, message: error.message } });
+      }
+      recordTurnUsage({
+        model: route?.slug || requestedModel,
+        provider: route ? canonicalProviderId(route.provider) : "openai",
+        status: finalStatus,
+        durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
+        reasoningStreamed,
+        retries: upstreamRetries,
+        ...usage,
+        estimatedInputTokens,
+        ...toolResultAging,
+        ...imageBudget,
+        ...(streamed ? { streamAborted: true } : {}),
+        ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
+        ...(failoverFrom ? { failoverFrom } : {}),
+      }, diagnostics);
+      usageRecorded = true;
+      return;
+    }
     // Codex may close a native stream immediately after response.completed.
     // That is a successful terminal turn, not a canceled generation.
     if (!route && clientGone && usageTransform?.completedResponseObserved() === true) {
       finalStatus = upstreamStatus ?? response.statusCode;
       activityStatus = finalStatus;
       if (!usageRecorded) {
-        recordObservedUsage({
+        recordTurnUsage({
           model: requestedModel,
           provider: "openai",
           status: finalStatus,
@@ -5889,7 +6142,7 @@ async function handleResponses(request, response, requestUrl) {
       finalStatus = 0;
       activityStatus = 0;
       if (!usageRecorded) {
-        recordObservedUsage({
+        recordTurnUsage({
           model: route?.slug || requestedModel,
           provider: route ? canonicalProviderId(route.provider) : "openai",
           status: 0,
@@ -5917,7 +6170,7 @@ async function handleResponses(request, response, requestUrl) {
     finalStatus = response.headersSent ? 502 : httpErrorStatus(error);
     activityStatus = finalStatus;
     if (!usageRecorded) {
-      recordObservedUsage({
+      recordTurnUsage({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: finalStatus,
@@ -5943,7 +6196,7 @@ async function handleResponses(request, response, requestUrl) {
     throw error;
   } finally {
     const status = activityStatus ?? finalStatus ?? response.statusCode;
-    activity.finish(status);
+    activity.finish(status, { generationOutcome, httpStatus: turnHttpStatus });
     // Timestamped per-request timing for latency diagnosis. Never gated on
     // QUIET: the production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1. A
     // missing provider count is logged as unknown, not zero; an explicit zero
@@ -6626,11 +6879,13 @@ const server = http.createServer((request, response) => {
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
-          type: "local_router_error",
+          type: error instanceof GoalContinuationNoProgressError ? "invalid_request_error" : "local_router_error",
           code: transport?.code || error?.code,
           message: transport
             ? `The local router could not complete the request: ${transport.cause}.${transport.hint}`
-            : "The local router could not complete the request.",
+            : error instanceof GoalContinuationNoProgressError
+              ? error.message
+              : "The local router could not complete the request.",
         },
       });
     } else {
@@ -6715,3 +6970,5 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
 });
 
 installGracefulShutdown(server, { label: "codex-router" });
+process.once("SIGTERM", () => nativeWsPools.closeAll());
+process.once("SIGINT", () => nativeWsPools.closeAll());

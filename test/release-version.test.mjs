@@ -85,7 +85,7 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   assert.match(release, /actions\/workflows\/ci\.yml\/runs\?head_sha=\$\{GITHUB_SHA\}/);
   assert.match(release, /select\(\.conclusion == "success"/);
   assert.match(release, /needs: release-preflight/);
-  assert.match(release, /needs: \[release-preflight, unified-app\]/);
+  assert.match(release, /needs: \[release-preflight, unified-app, unified-app-macos\]/);
   assert.ok(
     release.indexOf("- run: npm test") < release.indexOf("gh release create"),
     "the release must pass the full test suite before publishing assets",
@@ -103,7 +103,12 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   assert.match(release, /-ArgumentList "--quit-for-update"/);
   assert.match(release, /install -m 0755/);
   assert.match(release, /model-router-\$\{version\}-linux-x64\.tar\.gz/);
-  assert.doesNotMatch(release, /platform: macos|macos-latest|model-router-\$\{version\}-macos/);
+  assert.match(release, /unified-app-macos:/);
+  assert.match(release, /continue-on-error: true/);
+  assert.match(release, /trusted signing team is pinned/);
+  assert.match(release, /signing team does not match the repository trust pin/);
+  assert.match(release, /needs\.release-preflight\.result == 'success'/);
+  assert.match(release, /needs\.unified-app\.result == 'success'/);
   assert.match(release, /unsigned tester artifacts/);
   assert.match(release, /matching Codex Router version/);
   assert.match(release, /sha256sum codex-router-\* model-router-\* > SHA256SUMS/);
@@ -114,7 +119,7 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   assert.match(release, /git push origin main/);
   assert.doesNotMatch(release, /HOMEBREW_TAP_TOKEN/);
 
-  // macOS stays a CI-only artifact until it can be signed for distribution.
+  // macOS release assets remain disabled until a trusted signer is configured.
   // CI requests both architectures and verifies the actual nested executables,
   // rather than trusting the builder's output filename.
   assert.match(ci, /MODEL_ROUTER_TRAY_UNIVERSAL: "1"/);
@@ -138,7 +143,10 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   );
   assert.match(ci, /Smoke the unified macOS app lifecycle/);
   assert.match(ci, /"\$outer" --supervised/);
-  assert.match(ci, /"\$embedded" --query-lifecycle/);
+  assert.match(ci, /execFileSync\(process\.argv\[1\], \["--query-lifecycle"\]/);
+  assert.match(ci, /timeout: 10000, killSignal: "SIGKILL"/);
+  assert.match(ci, /delete env\.ELECTRON_RUN_AS_NODE/);
+  assert.match(ci, /if ! last_state=\$\(query_lifecycle\); then\s+cat "\$log" >&2 \|\| true\s+return 1/);
   assert.match(ci, /terminate_bundle io\.github\.codex-router\.control-center/);
   assert.match(ci, /terminate_bundle io\.github\.codex-router\.tray/);
   assert.match(ci, /assert_single_outer_host/);

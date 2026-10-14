@@ -95,8 +95,17 @@ import {
   stripCodexEncryptedSchemaAnnotation,
 } from "./tool-schema-root.mjs";
 import { requestGenericProvider } from "./generic-providers.mjs";
+import { genericProviderWebSocketTarget } from "./generic-providers.mjs";
 import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
 import { withoutInputMessagePhase } from "./message-phase.mjs";
+import {
+  WsUpgradeRefusedError,
+  collectResponsesRequest,
+  markWsTransportFailure,
+  responsesWebSocketTransportUsable,
+  wsTransportAvailable,
+} from "./responses-ws-client.mjs";
+import { providerPoolRegistry } from "./provider-ws-pool.mjs";
 import { providerTransportError } from "./transport-failure.mjs";
 import {
   endpointCapabilityError,
@@ -1675,6 +1684,30 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
   return headers;
 }
 
+// The reasons Cline is known to put in an unsuccessful envelope, each mapped
+// to a diagnosis the router words itself. Anything else gets the generic
+// sentence: an unrecognized upstream string may echo prompt or account text.
+const CLINEPASS_REFUSALS = new Map([
+  [
+    "empty response content",
+    {
+      code: "clinepass_empty_response",
+      message:
+        "ClinePass returned no content for this non-streaming request. The same model usually answers when the request is streamed.",
+    },
+  ],
+]);
+
+function clinePassRefusal(reason) {
+  const known = typeof reason === "string"
+    ? CLINEPASS_REFUSALS.get(reason.trim().toLowerCase())
+    : undefined;
+  return known || {
+    code: "clinepass_unsuccessful_response",
+    message: "ClinePass answered with an unsuccessful response and no completion.",
+  };
+}
+
 async function relayUpstreamResponse(
   normalized,
   upstream,
@@ -1691,8 +1724,9 @@ async function relayUpstreamResponse(
   ) {
     // Cline's non-streaming API wraps successful completions in success/data.
     // LiteLLM needs choices at the root. Buffer under the shared upstream limit
-    // before committing any bytes, and leave errors or unknown shapes intact.
+    // before committing any bytes, and leave unknown shapes intact.
     let body = await readResponseBody(upstream);
+    let refusal;
     try {
       const envelope = JSON.parse(body.toString("utf8"));
       if (
@@ -1701,9 +1735,40 @@ async function relayUpstreamResponse(
         !Array.isArray(envelope.data) && Array.isArray(envelope.data.choices)
       ) {
         body = Buffer.from(JSON.stringify(envelope.data), "utf8");
+      } else if (
+        envelope && typeof envelope === "object" && !Array.isArray(envelope) &&
+        envelope.success === false && !Array.isArray(envelope.choices)
+      ) {
+        refusal = clinePassRefusal(envelope.error);
       }
     } catch {
       // Malformed JSON belongs to the upstream; relay the original bytes.
+    }
+    if (refusal) {
+      // An HTTP 200 that Cline itself marks unsuccessful carries no root
+      // `choices`, so relaying it intact only moved the failure one hop: the
+      // gateway answered 500 "provider returned a response with no 'choices'"
+      // and the real cause never reached the caller (#938). Say what happened
+      // with a gateway-shaped error instead. The message is a fixed diagnosis
+      // chosen by an allowlisted reason; no upstream text is relayed or logged.
+      //
+      // 500, not 502: the origin ran and answered, so this is not a failure an
+      // intermediary may repeat. The gateway would still retry any 5xx, which
+      // is why ClinePass deployments are single-shot in litellm-config.mjs.
+      recordUpstreamLimits(normalized, telemetryUpstream);
+      if (!QUIET) {
+        console.error(
+          `[api-forwarder] provider=${normalized.provider.id} model=${normalized.model.upstreamModel} status=${upstream.status} refused=${refusal.code} duration_ms=${Date.now() - startedAt}`,
+        );
+      }
+      writeJson(response, 500, {
+        error: {
+          type: "provider_api_proxy_error",
+          code: refusal.code,
+          message: refusal.message,
+        },
+      });
+      return;
     }
     upstream = new Response(body, {
       status: upstream.status,
@@ -1737,6 +1802,14 @@ async function relayUpstreamResponse(
     responsesStream
       ? createResponsesStreamTransform(flatToNative, {
           pinResponseId: normalized.provider.authProfile === "github-copilot",
+          // Not gated on QUIET: this is the only place the reason is ever
+          // written down. The gateway relays the frame as a bare "in-stream
+          // error", so without this line a refused stream cannot be diagnosed
+          // from any log (#837).
+          // User-model IDs may contain controls or be large; keep one bounded line.
+          onInvalid: (reason) => console.error(
+            `[api-forwarder] refused Responses stream provider=${JSON.stringify(String(normalized.provider.id).slice(0, 256))} model=${JSON.stringify(String(normalized.model.upstreamModel).slice(0, 256))}: ${reason}`,
+          ),
         })
       : undefined,
     responsesJson ? createResponsesJsonTransform(flatToNative) : undefined,
@@ -1864,6 +1937,50 @@ function localModels(response) {
   });
 }
 
+// Keep canonical normalized full requests and transforms; only replace the
+// upstream transport. Continuations without full input remain on HTTP.
+const genericProviderPools = providerPoolRegistry({
+  resolveProvider: (providerId, requestPath) => ({
+    wsTarget: () => genericProviderWebSocketTarget(providerId, requestPath),
+  }),
+});
+
+function genericWsBreakerKey(providerId) {
+  return `generic-ws:${providerId}`;
+}
+
+async function acquireGenericWebSocketResponses(normalized, controller, requestPath) {
+  const providerId = normalized.provider.id;
+  if (!wsTransportAvailable(genericWsBreakerKey(providerId))) return undefined;
+  if (!responsesWebSocketTransportUsable()) return undefined;
+  let payload;
+  try { payload = JSON.parse(normalized.body.toString("utf8")); } catch { return undefined; }
+  if (payload?.stream !== true || !Array.isArray(payload.input) || payload.previous_response_id) return undefined;
+  let lease;
+  try {
+    const pool = await genericProviderPools.poolFor(providerId, requestPath);
+    lease = await pool.acquire(controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted) throw error;
+    markWsTransportFailure(genericWsBreakerKey(providerId));
+    console.warn("[api-forwarder] websocket transport unavailable provider=%s%s; using HTTP", providerId,
+      error instanceof WsUpgradeRefusedError && error.status !== undefined ? ` upgrade_status=${error.status}` : "");
+    return undefined;
+  }
+  let result;
+  try {
+    result = await collectResponsesRequest(lease.connection, payload, {
+      signal: controller.signal,
+      onSettled: () => lease.release(),
+    });
+  } catch (error) {
+    lease.connection.abort();
+    lease.release();
+    throw error;
+  }
+  return { result };
+}
+
 async function handleRequest(request, response) {
   const startedAt = Date.now();
   const requestUrl = new URL(
@@ -1906,6 +2023,13 @@ async function handleRequest(request, response) {
   // resolve it through the built-in credential path or construct its URL here;
   // either would bypass the confinement #404 established.
   if (normalized.provider.generic === true) {
+    if (normalized.provider.transport === "websocket" && normalized.provider.protocol === "openai-responses" && route === "/responses") {
+      const ws = await acquireGenericWebSocketResponses(normalized, controller, `${route}${requestUrl.search}`);
+      if (ws) {
+        await relayUpstreamResponse(normalized, ws.result, response, startedAt);
+        return;
+      }
+    }
     const { response: upstream, dispatcher } = await requestGenericProvider(
       normalized.provider.id,
       `${route}${requestUrl.search}`,
@@ -2342,3 +2466,7 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
 });
 
 installGracefulShutdown(server, { label: "api-forwarder" });
+// Pooled upstream WebSocket connections hold sockets open past the HTTP
+// server's own drain; shut them down with the process.
+process.once("SIGTERM", () => genericProviderPools.closeAll());
+process.once("SIGINT", () => genericProviderPools.closeAll());

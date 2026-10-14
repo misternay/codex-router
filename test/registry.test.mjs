@@ -39,7 +39,11 @@ test("provider registry exposes configured API and OAuth model families", () => 
     LISTED_MODELS.map((model) => model.slug),
     [
       "ainetcafe/kimi-k3",
+      "anthropic-api/claude-fable-5.1",
+      "anthropic-api/claude-haiku-5.5",
       "anthropic-api/claude-opus-4.8",
+      "anthropic-api/claude-opus-5.5",
+      "anthropic-api/claude-sonnet-5.5",
       "antigravity-oauth/gemini-3.1-pro",
       "antigravity-oauth/gemini-3.5-flash",
       "antigravity-oauth/gemini-3.6-flash",
@@ -96,6 +100,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/minimax-m2.7",
       "commandcode/minimax-m3",
       "commandcode/muse-spark-1.2",
+      "commandcode/muse-spark-1.3-contributor",
       "commandcode/muse-spark-1.3",
       "commandcode/nemotron-3-ultra",
       "commandcode/qwen3.7-flash",
@@ -104,7 +109,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.8-flash",
       "commandcode/qwen3.8-max-0902",
       "commandcode/qwen3.8-max",
-      "commandcode/stealth/space-bunny-alpha",
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b",
       "deepseek/deepseek-v4-flash",
@@ -210,7 +214,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-responses/grok-4.7",
       "opencode-go-responses/muse-spark-1.2-contributor",
       "opencode-go-responses/muse-spark-1.3-contributor",
-      "opencode-free-responses/muse-spark-1.3-contributor-free",
       "openrouter/claude-fable-5.1",
       "openrouter/deepseek-v4-pro",
       "openrouter/deepseek-v4.1-flash",
@@ -228,7 +231,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "openrouter/muse-spark-1.3-contributor",
       "openrouter/muse-spark-1.3",
       "openrouter/qwen3.8-flash",
-      "openrouter/stealth/space-bunny-alpha",
       "qwen-plan/deepseek-v4-flash-0731",
       "qwen-plan/deepseek-v4-pro-0813",
       "qwen-plan/deepseek-v4-pro",
@@ -672,6 +674,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     assert.deepEqual(MODEL_BY_SLUG.get(slug).searchTool, { mode: "hosted" });
   }
   const standaloneSearchSlugs = new Set([
+    "opencode-go/glm-5.3-flash",
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
@@ -861,6 +864,23 @@ test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   ]) {
     assert.deepEqual(MODEL_BY_SLUG.get(slug)?.searchTool, { mode: "standalone" }, slug);
   }
+});
+
+// DeepSeek documents low/high/max for the V4 family and the forwarder already
+// maps all three (`deepSeekEffort`). V4 Pro used to advertise only high/max, so
+// the Codex picker could not select the lower-effort rung its Flash siblings offer
+// (#887). The default stays `high`.
+test("DeepSeek V4 Pro on the direct API advertises the same effort ladder as V4 Flash", () => {
+  const pro = MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro");
+  const flash = MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash");
+  assert.deepEqual(
+    pro.reasoningLevels.map((level) => level.effort),
+    ["low", "high", "max"],
+  );
+  assert.deepEqual(pro.reasoningLevels, flash.reasoningLevels);
+  assert.equal(pro.defaultEffort, "high");
+  assert.equal(pro.requestProfile, "deepseek-thinking");
+  assert.equal(pro.compHash, "deepseek-v4-pro-v2");
 });
 
 test("DeepSeek V4 Flash Vision Exp advertises only verified direct-API capabilities", () => {
@@ -1867,6 +1887,25 @@ test("the Copilot auth profile cannot be attached to an OAuth provider", async (
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// LiteLLM retries every status of 500 and above twice. ClinePass can answer
+// HTTP 200 and still declare the result unsuccessful, which the forwarder
+// reports as a 500, so its deployments are single-shot: the prompt must not
+// reach Cline three times for a result the origin already produced.
+test("ClinePass deployments are single-shot inside LiteLLM, and only they are", () => {
+  const rendered = renderLiteLlmConfig();
+  const blocks = [...rendered.matchAll(/  - model_name: "([^"]+)"\n([\s\S]*?)(?=\n  - model_name:|\nlitellm_settings:)/g)];
+  const clinePass = MODELS.filter((model) => model.provider === "clinepass").map((model) => model.gatewayModel);
+  assert.ok(clinePass.length > 0);
+  for (const gatewayModel of clinePass) {
+    const block = blocks.find((entry) => entry[1] === gatewayModel);
+    assert.ok(block, gatewayModel);
+    assert.match(block[2], /^      num_retries: 0$/m, gatewayModel);
+  }
+  const deepSeek = blocks.find((entry) => entry[1] === "deepseek-v4-flash");
+  assert.ok(deepSeek);
+  assert.doesNotMatch(deepSeek[2], /num_retries/);
 });
 
 // The OpenAI-compatible surface silently ignores num_ctx, so a local model

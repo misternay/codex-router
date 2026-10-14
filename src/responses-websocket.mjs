@@ -1,5 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { constants as bufferConstants } from "node:buffer";
 import { TextDecoder } from "node:util";
+import { boundImagePayload, boundedJsonByteLength, MAX_REQUEST_JSON_DEPTH } from "./prompt-image-budget.mjs";
 
 import { authenticatedRoute, secretEqual } from "./caller-auth.mjs";
 import {
@@ -8,8 +10,20 @@ import {
   readResponseBody,
 } from "./http-utils.mjs";
 import { HeaderlessSseDetector } from "./sse-prefix.mjs";
+import {
+  MAX_FRAGMENT_FRAMES,
+  RESPONSES_WEBSOCKET_BETA,
+  WebSocketFrameParser,
+  acceptUpgrade,
+  closePayload,
+  encodeFrame,
+  rejectUpgrade,
+  validWebSocketKey,
+} from "./ws-frames.mjs";
 
-export const RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
+// The beta token moved to ws-frames.mjs, which both directions of the
+// protocol import; re-exported here for existing importers.
+export { RESPONSES_WEBSOCKET_BETA } from "./ws-frames.mjs";
 
 const RESPONSE_ROUTES = new Set(["/responses", "/v1/responses"]);
 const FORWARDED_REQUEST_HEADERS = new Set([
@@ -67,7 +81,7 @@ const PER_REQUEST_IDENTITY_HEADERS = new Set([
   "x-openai-subagent",
 ]);
 const MAX_QUEUED_REQUESTS = 2;
-const MAX_FRAGMENT_FRAMES = 1_024;
+const MAX_INTERRUPT_PENDING_ITEMS = 256;
 const MAX_TURN_METADATA_HEADER_BYTES = 8 * 1_024;
 const MAX_RATE_LIMIT_FAMILIES = 16;
 const MAX_RATE_LIMIT_FAMILY_CANDIDATES = 64;
@@ -101,88 +115,6 @@ function requestHasBeta(request) {
     .split(",")
     .map((value) => value.trim())
     .includes(RESPONSES_WEBSOCKET_BETA);
-}
-
-function validWebSocketKey(value) {
-  if (typeof value !== "string" || !/^[A-Za-z0-9+/]{22}==$/.test(value)) return false;
-  const decoded = Buffer.from(value, "base64");
-  return decoded.length === 16 && decoded.toString("base64") === value;
-}
-
-function rejectUpgrade(socket, status, message, extraHeaders = {}) {
-  if (socket.destroyed) return;
-  const body = Buffer.from(
-    JSON.stringify({ error: { type: "websocket_upgrade_rejected", message } }),
-    "utf8",
-  );
-  const reason = {
-    400: "Bad Request",
-    401: "Unauthorized",
-    403: "Forbidden",
-    404: "Not Found",
-    426: "Upgrade Required",
-  }[status] || "Error";
-  const lines = [
-    `HTTP/1.1 ${status} ${reason}`,
-    "Connection: close",
-    "Content-Type: application/json",
-    `Content-Length: ${body.length}`,
-    ...Object.entries(extraHeaders).map(([name, value]) => `${name}: ${value}`),
-    "",
-    "",
-  ];
-  socket.end(Buffer.concat([Buffer.from(lines.join("\r\n"), "ascii"), body]));
-}
-
-function acceptUpgrade(request, socket) {
-  const accept = createHash("sha1")
-    .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest("base64");
-  socket.write(
-    [
-      "HTTP/1.1 101 Switching Protocols",
-      "Upgrade: websocket",
-      "Connection: Upgrade",
-      `Sec-WebSocket-Accept: ${accept}`,
-      "",
-      "",
-    ].join("\r\n"),
-  );
-}
-
-function encodeFrame(opcode, payload = Buffer.alloc(0)) {
-  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
-  let header;
-  if (data.length < 126) {
-    header = Buffer.from([0x80 | opcode, data.length]);
-  } else if (data.length <= 0xffff) {
-    header = Buffer.allocUnsafe(4);
-    header[0] = 0x80 | opcode;
-    header[1] = 126;
-    header.writeUInt16BE(data.length, 2);
-  } else {
-    header = Buffer.allocUnsafe(10);
-    header[0] = 0x80 | opcode;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(data.length), 2);
-  }
-  return Buffer.concat([header, data], header.length + data.length);
-}
-
-function closePayload(code, reason) {
-  const text = Buffer.from(String(reason || ""), "utf8").subarray(0, 123);
-  const payload = Buffer.allocUnsafe(2 + text.length);
-  payload.writeUInt16BE(code, 0);
-  text.copy(payload, 2);
-  return payload;
-}
-
-function validCloseCode(code) {
-  return (
-    [1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014]
-      .includes(code) ||
-    (code >= 3000 && code <= 4999)
-  );
 }
 
 function isCallerAuthorization(value, callerKey) {
@@ -553,9 +485,31 @@ function rateLimitResponseHeaders(headers) {
   return projected;
 }
 
+// The frame's byte cap is already enforced. Reject pathological nesting before
+// JSON.parse allocates a tree, counting delimiters only outside quoted strings.
+function jsonNestingAllowed(text) {
+  let depth = 0, quoted = false, escaped = false;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (code === 0x5c) escaped = true;
+      else if (code === 0x22) quoted = false;
+    } else if (code === 0x22) quoted = true;
+    else if (code === 0x7b || code === 0x5b) {
+      if (++depth > MAX_REQUEST_JSON_DEPTH) return false;
+    } else if (code === 0x7d || code === 0x5d) depth--;
+  }
+  return true;
+}
+
 function continuationState(input, output, maxBytes) {
-  const encoded = Buffer.from(JSON.stringify({ input, output }), "utf8");
-  return encoded.length <= maxBytes ? { input, output } : undefined;
+  const bounded = boundImagePayload([...input, ...output], {
+    protectPending: true, maxTokens: Infinity,
+    maxBodyBytes: maxBytes, bodyBytes: boundedJsonByteLength({ input, output }),
+  });
+  const state = { input: bounded.input.slice(0, input.length), output: bounded.input.slice(input.length) };
+  return boundedJsonByteLength(state, maxBytes) <= maxBytes ? state : undefined;
 }
 
 function continuationItemKey(item) {
@@ -660,6 +614,12 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
   let text = "";
   let dataLines = [];
   let dataChars = 0;
+  const checkLineSize = (line) => {
+    if (Buffer.byteLength(line, "utf8") <= maxEventBytes) return;
+    const error = new Error(`Responses SSE line exceeds ${maxEventBytes} bytes.`);
+    error.code = "ERR_RESPONSES_WS_EVENT_TOO_LARGE";
+    throw error;
+  };
   const dispatch = async () => {
     if (dataLines.length === 0) return true;
     const data = dataLines.join("\n");
@@ -669,6 +629,7 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
     return onEvent(data);
   };
   const consumeLine = async (line) => {
+    checkLineSize(line);
     if (line.endsWith("\r")) line = line.slice(0, -1);
     if (line === "") return dispatch();
     if (line.startsWith(":")) return true;
@@ -693,17 +654,15 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
       const { done, value } = await reader.read();
       if (done) break;
       text += decoder.decode(value, { stream: true });
-      if (Buffer.byteLength(text, "utf8") > maxEventBytes) {
-        const error = new Error(`Responses SSE line exceeds ${maxEventBytes} bytes.`);
-        error.code = "ERR_RESPONSES_WS_EVENT_TOO_LARGE";
-        throw error;
-      }
+      // An HTTP chunk can contain many bounded events. Check each complete
+      // line while consuming it, then bound only the unfinished line left over.
       let newline;
       while ((newline = text.indexOf("\n")) !== -1) {
         const line = text.slice(0, newline);
         text = text.slice(newline + 1);
         if ((await consumeLine(line)) === false) return;
       }
+      checkLineSize(text);
     }
     text += decoder.decode();
     if (text && (await consumeLine(text)) === false) return;
@@ -719,11 +678,6 @@ class ResponsesWebSocketPeer {
     this.socket = socket;
     this.request = request;
     this.options = options;
-    this.buffer = Buffer.alloc(0);
-    this.fragmentOpcode = undefined;
-    this.fragments = [];
-    this.fragmentBytes = 0;
-    this.fragmentFrames = 0;
     this.closed = false;
     this.closeSent = false;
     this.pendingRequests = 0;
@@ -731,22 +685,63 @@ class ResponsesWebSocketPeer {
     this.abortController = new AbortController();
     this.continuations = new Map();
     this.turnState = undefined;
+    this.activeResponse = undefined;
+    this.lastResponseId = undefined;
+    // The peer is the server side, so it parses masked client frames and
+    // answers pings itself; the shared codec owns every frame-level rule.
+    this.parser = new WebSocketFrameParser({
+      expectMasked: true,
+      maxMessageBytes: options.maxMessageBytes || MAX_BODY_BYTES,
+      maxFragmentFrames: options.maxFragmentFrames || MAX_FRAGMENT_FRAMES,
+      onText: (text) => this.enqueue(text),
+      onBinary: () =>
+        this.fail(1003, "Binary Responses WebSocket messages are not supported."),
+      onPing: (payload) => this.send(0xa, payload),
+      onPong: () => {},
+      onClose: ({ code, reason }) => {
+        if (!this.closeSent) {
+          this.closeSent = true;
+          this.send(0x8, code === undefined ? Buffer.alloc(0) : closePayload(code, reason));
+        }
+        this.socket.end();
+        this.abort();
+      },
+      onFail: (code, reason) => this.fail(code, reason),
+    });
   }
 
   start(head) {
-    this.socket.on("error", () => this.abort());
-    this.socket.on("close", () => this.abort());
-    this.socket.on("end", () => this.abort());
-    this.socket.on("data", (chunk) => this.feed(chunk));
-    if (head?.length) this.feed(head);
+    this.socket.on("error", () => this.abort({ hard: true }));
+    this.socket.on("close", () => this.abort({ hard: true }));
+    this.socket.on("end", () => this.abort({ hard: true }));
+    this.socket.on("data", (chunk) => this.parser.feed(chunk));
+    if (head?.length) this.parser.feed(head);
     this.socket.resume?.();
   }
 
-  abort() {
-    if (this.closed) return;
+  // `hard` is for transport-level ends (FIN, reset, error): the peer is not
+  // reading any more, so a queued frame can never drain and waiting for it
+  // would hold the descriptor open. A received close frame keeps the graceful
+  // path so the close reply still flushes before the socket is released.
+  abort({ hard = false } = {}) {
+    if (this.closed) {
+      // A close reply may still be blocked in destroySoon(). A later FIN or
+      // error must release the transport without repeating turn cancellation.
+      if (hard && !this.socket.destroyed) this.socket.destroy();
+      return;
+    }
     this.closed = true;
+    this.parser.stop();
     this.abortController.abort(new Error("Responses WebSocket closed."));
     this.continuations.clear();
+    // The upgraded socket came from http.Server, which allows half-open
+    // connections, so a peer that goes away without a close frame ends only
+    // the readable side. Nothing else closes the writable side, and Node keeps
+    // the descriptor until something does: one leaked handle per dropped
+    // connection, for the life of the process.
+    if (this.socket.destroyed) return;
+    if (hard) this.socket.destroy();
+    else this.socket.destroySoon();
   }
 
   send(opcode, payload) {
@@ -794,133 +789,22 @@ class ResponsesWebSocketPeer {
     this.abort();
   }
 
-  feed(chunk) {
-    if (this.closed || !chunk?.length) return;
-    this.buffer = this.buffer.length
-      ? Buffer.concat([this.buffer, chunk], this.buffer.length + chunk.length)
-      : Buffer.from(chunk);
-    while (!this.closed) {
-      if (this.buffer.length < 2) return;
-      const first = this.buffer[0];
-      const second = this.buffer[1];
-      const fin = Boolean(first & 0x80);
-      const opcode = first & 0x0f;
-      if (first & 0x70) return this.fail(1002, "WebSocket extensions were not negotiated.");
-      if (!(second & 0x80)) return this.fail(1002, "Client frames must be masked.");
-      let length = second & 0x7f;
-      let offset = 2;
-      if (length === 126) {
-        if (this.buffer.length < 4) return;
-        length = this.buffer.readUInt16BE(2);
-        offset = 4;
-      } else if (length === 127) {
-        if (this.buffer.length < 10) return;
-        const longLength = this.buffer.readBigUInt64BE(2);
-        if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) {
-          return this.fail(1009, "WebSocket frame is too large.");
-        }
-        length = Number(longLength);
-        offset = 10;
-      }
-      const control = opcode >= 0x8;
-      if (control && (!fin || length > 125)) {
-        return this.fail(1002, "Invalid WebSocket control frame.");
-      }
-      if (length > this.options.maxMessageBytes) {
-        return this.fail(1009, "WebSocket message is too large.");
-      }
-      const frameBytes = offset + 4 + length;
-      if (this.buffer.length < frameBytes) return;
-      const mask = this.buffer.subarray(offset, offset + 4);
-      const encoded = this.buffer.subarray(offset + 4, frameBytes);
-      const payload = Buffer.allocUnsafe(length);
-      for (let index = 0; index < length; index += 1) {
-        payload[index] = encoded[index] ^ mask[index & 3];
-      }
-      this.buffer = this.buffer.subarray(frameBytes);
-      this.handleFrame({ fin, opcode, payload });
-    }
-  }
-
-  handleFrame({ fin, opcode, payload }) {
-    if (opcode === 0x8) {
-      if (payload.length === 1) return this.fail(1002, "Invalid WebSocket close frame.");
-      if (payload.length >= 2) {
-        const code = payload.readUInt16BE(0);
-        if (!validCloseCode(code)) return this.fail(1002, "Invalid WebSocket close code.");
-        try {
-          new TextDecoder("utf-8", { fatal: true }).decode(payload.subarray(2));
-        } catch {
-          return this.fail(1007, "Invalid WebSocket close reason.");
-        }
-      }
-      if (!this.closeSent) {
-        this.closeSent = true;
-        this.send(0x8, payload);
-      }
-      this.socket.end();
-      this.abort();
-      return;
-    }
-    if (opcode === 0x9) {
-      this.send(0xa, payload);
-      return;
-    }
-    if (opcode === 0xa) return;
-    if (![0x0, 0x1, 0x2].includes(opcode)) {
-      this.fail(1002, "Unsupported WebSocket opcode.");
-      return;
-    }
-    if (opcode === 0x2 || (opcode === 0x0 && this.fragmentOpcode === 0x2)) {
-      this.fail(1003, "Binary Responses WebSocket messages are not supported.");
-      return;
-    }
-    if (opcode === 0x0) {
-      if (this.fragmentOpcode === undefined) {
-        this.fail(1002, "Unexpected WebSocket continuation frame.");
-        return;
-      }
-    } else if (this.fragmentOpcode !== undefined) {
-      this.fail(1002, "A fragmented WebSocket message is already in progress.");
-      return;
-    } else if (!fin) {
-      this.fragmentOpcode = opcode;
-    }
-    this.fragmentBytes += payload.length;
-    this.fragmentFrames += 1;
-    if (this.fragmentFrames > this.options.maxFragmentFrames) {
-      this.fail(1009, "WebSocket message has too many fragments.");
-      return;
-    }
-    if (this.fragmentBytes > this.options.maxMessageBytes) {
-      this.fail(1009, "WebSocket message is too large.");
-      return;
-    }
-    this.fragments.push(payload);
-    if (!fin) return;
-    const complete = Buffer.concat(this.fragments, this.fragmentBytes);
-    this.fragments = [];
-    this.fragmentBytes = 0;
-    this.fragmentFrames = 0;
-    this.fragmentOpcode = undefined;
-    let text;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(complete);
-    } catch {
-      this.fail(1007, "WebSocket text is not valid UTF-8.");
-      return;
-    }
-    this.enqueue(text);
-  }
-
   enqueue(text) {
+    // Control messages must bypass the generation queue: queuing interrupt
+    // behind the turn it interrupts leaves a 400 for the following turn.
+    const request = this.parseRequest(text);
+    if (!request) return;
+    if (request.type === "response.interrupt") {
+      this.interrupt(request);
+      return;
+    }
     this.pendingRequests += 1;
     if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
       this.fail(1008, "Too many queued Responses requests.");
       return;
     }
     this.queue = this.queue
-      .then(() => this.process(text))
+      .then(() => this.process(request))
       .catch(() => {
         if (!this.closed) {
           this.sendError(500, {
@@ -934,8 +818,15 @@ class ResponsesWebSocketPeer {
       });
   }
 
-  async process(text) {
+  parseRequest(text) {
     if (this.closed) return;
+    if (!jsonNestingAllowed(text)) {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        message: "Responses request JSON is nested too deeply.",
+      });
+      return;
+    }
     let request;
     try {
       request = JSON.parse(text);
@@ -946,13 +837,84 @@ class ResponsesWebSocketPeer {
       });
       return;
     }
-    if (!request || Array.isArray(request) || request.type !== "response.create") {
+    if (!request || typeof request !== "object" || Array.isArray(request) ||
+        !["response.create", "response.interrupt"].includes(request.type)) {
       this.sendError(400, {
         type: "invalid_request_error",
-        message: "Responses WebSocket messages must have type response.create.",
+        code: "unsupported_websocket_event",
+        message: "Responses WebSocket messages must have type response.create or response.interrupt.",
       });
       return;
     }
+    return request;
+  }
+
+  interrupt(request) {
+    if (typeof request.response_id !== "string" || !request.response_id ||
+        request.mode !== "discard_partial_items") {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        message: "response.interrupt requires response_id and mode=discard_partial_items.",
+      });
+      return;
+    }
+    const active = this.activeResponse;
+    // Completion can win the race with a client's interrupt frame. Its
+    // terminal event already settles the turn; do not poison socket reuse.
+    if (request.response_id === this.lastResponseId && active?.id !== request.response_id) return;
+    if (!active || active.id !== request.response_id) {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        code: "response_not_found",
+        message: "The response to interrupt is not active on this connection.",
+      });
+      return;
+    }
+    if (active.interrupted || active.terminalSent) return;
+    active.interrupted = true;
+    this.sendJson({
+      type: "response.interrupt.accepted", response_id: active.id,
+      sequence_number: active.nextSequence++,
+    });
+    active.controller.abort(new Error("Responses generation interrupted by the client."));
+  }
+
+  async finishInterrupted(active) {
+    for (const [output_index, item_id] of active.pendingItems) {
+      if (!(await this.sendJsonWithBackpressure({
+        type: "response.output_item.interrupted", response_id: active.id,
+        item_id, output_index, sequence_number: active.nextSequence++,
+      }))) return;
+    }
+    const terminal = {
+      type: "response.incomplete", sequence_number: active.nextSequence++,
+      response: {
+        id: active.id, object: "response", status: "incomplete",
+        incomplete_details: { reason: "interrupted" },
+        output: active.completedItems,
+        ...(active.usage ? { usage: active.usage } : {}),
+      },
+    };
+    if (boundedJsonByteLength(terminal, this.options.maxEventBytes) > this.options.maxEventBytes) {
+      this.continuations.clear();
+      this.sendError(502, {
+        type: "ERR_RESPONSES_WS_INTERRUPT_STATE_TOO_LARGE",
+        message: "The interrupted response exceeds the bounded WebSocket snapshot size; resend the full context.",
+      });
+      return;
+    }
+    active.terminalSent = true;
+    if (!(await this.sendJsonWithBackpressure(terminal))) return;
+    this.lastResponseId = active.id;
+    this.continuations.clear();
+    const continuation = continuationState(
+      active.input, active.completedItems, this.options.maxContinuationBytes,
+    );
+    if (continuation && !active.continuationOverflow) this.continuations.set(active.id, continuation);
+  }
+
+  async process(request) {
+    if (this.closed) return;
     if (!Array.isArray(request.input) || request.stream !== true) {
       this.sendError(400, {
         type: "invalid_request_error",
@@ -998,19 +960,38 @@ class ResponsesWebSocketPeer {
     // `previous_response_id` names its baseline. Keep the current envelope as
     // authority. Inheriting absent fields from an earlier request would turn a
     // meaningful omission (for example no tools) into stale configuration.
-    const encoded = Buffer.from(JSON.stringify(fullRequest), "utf8");
-    if (encoded.length > this.options.maxMessageBytes) {
+    let boundedImages;
+    try {
+      boundedImages = boundImagePayload(fullRequest.input, {
+        protectPending: true, maxTokens: Infinity,
+        maxBodyBytes: this.options.maxMessageBytes, bodyBytes: boundedJsonByteLength(fullRequest),
+      });
+    } catch {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        message: "Responses request JSON is nested too deeply.",
+      });
+      return;
+    }
+    fullRequest.input = boundedImages.input;
+    if (boundedImages.stats.imageReferencesDropped > 0) {
+      console.error(`[codex-router] bounded WebSocket image history dropped=${boundedImages.stats.imageReferencesDropped} image-bytes-saved=${boundedImages.stats.imageBytesSaved}`);
+    }
+    if (boundedJsonByteLength(fullRequest, this.options.maxMessageBytes) > this.options.maxMessageBytes) {
       this.sendError(413, {
         type: "request_too_large",
         message: `Reconstructed Responses request exceeds ${this.options.maxMessageBytes} bytes.`,
       });
       return;
     }
+    const encoded = Buffer.from(JSON.stringify(fullRequest), "utf8");
 
     if (request.generate === false) {
       const responseId = `resp_router_prewarm_${randomUUID().replaceAll("-", "")}`;
+      this.lastResponseId = responseId;
       this.continuations.clear();
-      this.continuations.set(responseId, { input: fullRequest.input, output: [] });
+      const continuation = continuationState(fullRequest.input, [], this.options.maxContinuationBytes);
+      if (continuation) this.continuations.set(responseId, continuation);
       await this.sendJsonWithBackpressure({
         type: "response.created",
         response: { id: responseId },
@@ -1026,6 +1007,13 @@ class ResponsesWebSocketPeer {
     }
 
     const controller = new AbortController();
+    const active = {
+      controller, id: undefined, interrupted: false, terminalSent: false,
+      nextSequence: 0, completedItems: [], pendingItems: new Map(),
+      input: fullRequest.input, continuationOverflow: false,
+      completedBytes: 0, pendingBytes: 0,
+    };
+    this.activeResponse = active;
     const onClose = () => controller.abort(this.abortController.signal.reason);
     this.abortController.signal.addEventListener("abort", onClose, { once: true });
     let upstream;
@@ -1109,21 +1097,30 @@ class ResponsesWebSocketPeer {
           return;
         }
         if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
+        active.id = completedResponse.id;
+        // The JSON origin has already completed these items and charged its
+        // usage, even if downstream write backpressure delays their delivery.
+        active.completedItems = completedResponse.output;
+        active.usage = completedResponse.usage;
         if (!(await this.sendJsonWithBackpressure({
           type: "response.created",
           response: { ...completedResponse, status: "in_progress", output: [] },
         }))) return;
         for (const [outputIndex, item] of completedResponse.output.entries()) {
+          if (active.interrupted) return;
           if (!(await this.sendJsonWithBackpressure({
             type: "response.output_item.done",
             output_index: outputIndex,
             item,
           }))) return;
         }
+        if (active.interrupted) return;
+        active.terminalSent = true;
         if (!(await this.sendJsonWithBackpressure({
           type: "response.completed",
           response: completedResponse,
         }))) return;
+        this.lastResponseId = completedResponse.id;
         this.continuations.clear();
         const continuation = continuationState(
           fullRequest.input,
@@ -1152,11 +1149,37 @@ class ResponsesWebSocketPeer {
             throw error;
           }
           if (!event || typeof event !== "object" || Array.isArray(event)) return true;
+          // Do not let post-terminal trailers mutate interruption snapshots.
+          if (terminalSeen) return true;
+          if (active.interrupted) return false;
+          if (Number.isSafeInteger(event.sequence_number) && event.sequence_number >= 0) {
+            active.nextSequence = Math.max(active.nextSequence, event.sequence_number + 1);
+          }
+          if (event.type === "response.created" && typeof event.response?.id === "string") active.id = event.response.id;
+          if (event.response?.usage && typeof event.response.usage === "object") active.usage = event.response.usage;
+          if (event.type === "response.output_item.added" &&
+              Number.isSafeInteger(event.output_index) && event.output_index >= 0 &&
+              typeof event.item?.id === "string") {
+            const previous = active.pendingItems.get(event.output_index);
+            const pendingBytes = active.pendingBytes - Buffer.byteLength(previous || "")
+              + Buffer.byteLength(event.item.id);
+            if (pendingBytes > this.options.maxEventBytes ||
+                (!previous && active.pendingItems.size >= MAX_INTERRUPT_PENDING_ITEMS)) {
+              const error = new Error("The interrupted response item tracker exceeds its bounded size.");
+              error.code = "ERR_RESPONSES_WS_INTERRUPT_STATE_TOO_LARGE";
+              throw error;
+            }
+            active.pendingItems.set(event.output_index, event.item.id);
+            active.pendingBytes = pendingBytes;
+          }
+          if (event.type === "response.output_item.done") {
+            active.pendingBytes -= Buffer.byteLength(active.pendingItems.get(event.output_index) || "");
+            active.pendingItems.delete(event.output_index);
+          }
           // Match the Responses client: the first terminal event ends the
           // logical response. Drain the HTTP body for clean accounting and
           // connection reuse, but never graft a provider trailer onto the next
           // continuation baseline.
-          if (terminalSeen) return true;
           // Native Codex maps WebSocket `error` events only when they carry
           // an HTTP failure status. SSE can instead signal failure by ending
           // its body; the persistent socket has no such turn boundary.
@@ -1164,16 +1187,28 @@ class ResponsesWebSocketPeer {
               !(Number.isInteger(event.status) && event.status >= 400 && event.status <= 599)) {
             event = { ...event, status: 502 };
           }
-          if (!(await this.sendJsonWithBackpressure(event))) return false;
+          if (["response.completed", "response.failed", "response.incomplete", "error"].includes(event.type)) {
+            active.terminalSent = true;
+            if (active.id) this.lastResponseId = active.id;
+          }
           if (event.type === "response.output_item.done" && event.item) {
             const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
+            if (active.completedBytes + itemBytes > this.options.maxEventBytes) {
+              const error = new Error("The interrupted response snapshot exceeds its bounded size.");
+              error.code = "ERR_RESPONSES_WS_INTERRUPT_STATE_TOO_LARGE";
+              throw error;
+            }
+            active.completedItems.push(event.item);
+            active.completedBytes += itemBytes;
             if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
               outputItems.push(event.item);
               outputItemsBytes += itemBytes;
             } else {
               continuationOverflow = true;
+              active.continuationOverflow = true;
             }
           }
+          if (!(await this.sendJsonWithBackpressure(event))) return false;
           if (event.type === "response.completed") {
             completed = event.response;
             terminalSeen = true;
@@ -1206,7 +1241,7 @@ class ResponsesWebSocketPeer {
           )
           : undefined;
         if (continuation) this.continuations.set(completed.id, continuation);
-      } else if (!terminalFailure && !this.closed) {
+      } else if (!terminalFailure && !this.closed && !active.interrupted) {
         this.sendError(502, {
           type: "local_router_stream_failed",
           message: "The internal Responses stream ended before response.completed.",
@@ -1222,6 +1257,8 @@ class ResponsesWebSocketPeer {
     } finally {
       this.abortController.signal.removeEventListener("abort", onClose);
       controller.abort();
+      if (active.interrupted && !active.terminalSent && !this.closed) await this.finishInterrupted(active);
+      if (this.activeResponse === active) this.activeResponse = undefined;
     }
   }
 }
@@ -1244,8 +1281,11 @@ export function handleResponsesWebSocketUpgrade(
   },
 ) {
   maxMessageBytes = Number.isFinite(maxMessageBytes) && maxMessageBytes > 0
-    ? Math.floor(maxMessageBytes)
-    : MAX_BODY_BYTES;
+    ? Math.min(Math.floor(maxMessageBytes), bufferConstants.MAX_STRING_LENGTH)
+    : Math.min(
+      Number.isFinite(MAX_BODY_BYTES) && MAX_BODY_BYTES > 0 ? Math.floor(MAX_BODY_BYTES) : 128 * 1024 * 1024,
+      bufferConstants.MAX_STRING_LENGTH,
+    );
   maxEventBytes = Number.isFinite(maxEventBytes) && maxEventBytes > 0
     ? Math.floor(maxEventBytes)
     : MAX_BUFFERED_RESPONSE_BYTES;

@@ -104,6 +104,10 @@ printf '%s' 'Explain this repository.' |
   ./bin/model-router codex agents prompt anthropic --cwd "$PWD"
 ```
 
+Claude prompts also accept `--model` and `--effort`, including when resuming
+with `--session`. See the [adaptive worker routing pilot](docs/experiments/adaptive-worker-routing.md)
+for the supported controls and an offline comparison of routing policies.
+
 The ACP integrations follow the official [Cursor ACP](https://prod.cursor.com/docs/cli/acp)
 and [Gemini CLI ACP](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md)
 contracts. Direct reuse of Gemini CLI OAuth tokens in third-party software is
@@ -1057,7 +1061,10 @@ instruction overlay, and standalone tool-search contract as the proven
 full-size `zai-coding/glm-5.3` route. Standalone search keeps deferred tools out
 of the initial Codex tool surface and loads them through the native
 `tool_search` bridge on demand; this is the root fix for the large fixed prefix
-that made compacted Flash subagents reopen above their threshold. These
+that made compacted Flash subagents reopen above their threshold. OpenCode Go's
+Flash route advertises the same deferred tool loading and concise project-work
+instructions, with its 400K compaction threshold unchanged. A fresh desktop
+turn is still needed to verify the provider-facing tool count and replay. These
 execution/catalog capabilities are route-local: Flash remains conservative v1
 for shipped multi-agent capability until its exact route has a separate
 accepted `v2_agent` proof artifact. OpenCode Go's content moderation still
@@ -1112,6 +1119,7 @@ often for the repository to pin and live-verify individual entries:
 
 | Provider | Provider ID | Base URL |
 | --- | --- | --- |
+| AI/ML API | `aimlapi` | `https://api.aimlapi.com/v1` |
 | Groq | `groq` | `https://api.groq.com/openai/v1` |
 | Together AI | `together` | `https://api.together.xyz/v1` |
 | Fireworks AI | `fireworks` | `https://api.fireworks.ai/inference/v1` |
@@ -1124,6 +1132,13 @@ often for the repository to pin and live-verify individual entries:
 | GitHub Copilot | `github-copilot` | Account-specific GitHub Copilot endpoint |
 | Chutes | `chutes` | `https://llm.chutes.ai/v1` |
 | OrcaRouter | `orca` | `https://api.orcarouter.ai/v1` |
+
+AI/ML API uses `AIMLAPI_API_KEY` or a key stored through
+`./bin/model-router codex provider-key aimlapi set`. Run
+`./bin/curate-models aimlapi` after connecting: discovery keeps only models
+advertising the OpenAI chat-completions endpoint. No models are preselected.
+`AIMLAPI_API_BASE_URL` overrides the endpoint. Account cards show router traffic
+and link to the AI/ML API dashboard for usage and limits.
 
 `devin-cli` is the OAuth exception to this API-key table. After `devin auth
 login`, the Control Center and `./bin/curate-models devin-cli` read the model
@@ -1268,6 +1283,30 @@ an 8 MiB ceiling configurable through `MODEL_ROUTER_MAX_BUFFERED_RESPONSE_BYTES`
 The caller-authenticated health endpoint reports these limits, aggregate
 in-flight counts, bounded-buffer ceilings, and encrypted-relay cache metrics;
 the public health endpoint omits that resource detail.
+
+`CODEX_ROUTER_APP_CONNECTORS` can withhold the Codex app connectors from a
+routed Chat Completions or Messages model. Codex can send its full connector
+registry (`mcp__codex_apps__github`, `mcp__codex_apps__notion`, ...), adding
+hundreds of tool schemas to a turn. Supply the variable when installing or
+regenerating the service; the Linux, macOS, and Windows service definitions
+retain the setting until regenerated again. Restart an already-running service
+after changing its environment. A foreground router reads it from its launch
+environment. The setting is opt-in:
+
+- unset or empty: keep ordinary connector functions eager.
+- `none`: withhold every connector function.
+- `all`: keep ordinary connector functions eager, stated explicitly.
+- `airtable,gmail`: keep those connectors eager and withhold the rest;
+  trimmed, case-insensitive, unknown ids ignored.
+
+A withheld function is re-declared when stored call history, a forced choice,
+or an allowed-tools choice names it. With a client-executed `tool_search`,
+marked deferred functions can also be loaded through the existing search relay.
+Codex's own app tools, the collaboration runtime, the repls, image generation,
+and custom tools are outside connector selection. Explicitly deferred functions
+still follow the client tool-search contract; custom tools remain visible.
+Responses compatibility routes that translate namespace tools also use this
+policy; routes that preserve native namespace declarations bypass it.
 
 For routed external models, old textual tool results larger than 32 KiB are
 compacted after the model has acted on them. The four newest tool results stay
@@ -1690,6 +1729,13 @@ they scored against a known image, so a small confident-wrong reader never
 tops the list. Everything is rated against this machine's memory, anything too
 large is not offered, and anything already downloaded drops off. Add `--json`
 for the same data as an object.
+
+The local Ollama deployment uses `num_ctx: 16384` and a 600-second LiteLLM
+timeout by default. Set `MODEL_ROUTER_LOCAL_NUM_CTX` and
+`MODEL_ROUTER_LOCAL_TIMEOUT` (seconds) to positive integers in the router
+process environment to override them. The timeout applies to both streaming
+and non-streaming requests. Restart the router to regenerate its LiteLLM
+configuration after changing either value.
 
 Checking, installing, and removing are three separate actions on purpose:
 unchecking never deletes a download, and removing needs explicit confirmation.

@@ -55,6 +55,7 @@ export function hasDefaultUserModelReasoning(entry) {
 // identity and routing fields always come from the provider id and the
 // discovered model id.
 const METADATA_FIELDS = new Set([
+  "repetitionGuard",
   "displayName",
   "description",
   "contextWindow",
@@ -69,6 +70,7 @@ const METADATA_FIELDS = new Set([
   "availabilityNux",
   "upgradeTo",
   "requiresTrailingUserTurn",
+  "goalContinuationGuard",
   "isFree",
   "toolSchemaRecursion",
   "supportedEndpoints",

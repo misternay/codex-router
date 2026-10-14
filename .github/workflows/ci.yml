@@ -395,7 +395,14 @@ jobs:
           log="$RUNNER_TEMP/model-router-macos-smoke.log"
 
           query_lifecycle() {
-            /usr/bin/env -u ELECTRON_RUN_AS_NODE "$embedded" --query-lifecycle
+            node -e '
+              const { execFileSync } = require("node:child_process");
+              const env = { ...process.env };
+              delete env.ELECTRON_RUN_AS_NODE;
+              process.stdout.write(execFileSync(process.argv[1], ["--query-lifecycle"], {
+                env, encoding: "utf8", timeout: 10000, killSignal: "SIGKILL",
+              }));
+            ' "$embedded"
           }
 
           wait_for_lifecycle() {
@@ -404,7 +411,10 @@ jobs:
             expected_visible=$3
             last_state=
             for _ in {1..120}; do
-              last_state=$(query_lifecycle 2>/dev/null || true)
+              if ! last_state=$(query_lifecycle); then
+                cat "$log" >&2 || true
+                return 1
+              fi
               if node -e '
                 try {
                   const state = JSON.parse(process.argv[1]);

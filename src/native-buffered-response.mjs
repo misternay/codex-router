@@ -35,15 +35,31 @@ const TERMINAL_FAILED = new Set(["response.failed", "error"]);
  * @returns {{ status: number, body: object }}
  */
 export function foldResponsesSse(text) {
-  const items = [];
+  // An output_index is an ordering key, not an allocation size. A sparse array
+  // can scan billions of empty slots at filter(), and indices beyond the array
+  // range become properties that filter() silently drops. Store only items we
+  // actually received, keeping the old append and replacement semantics.
+  const items = new Map();
+  let nextIndex = 0;
   let terminal;
   let failure;
   for (const block of String(text || "").split(/\r?\n\r?\n/)) {
     const event = parseSseBlockEvent(block);
     if (!event || typeof event !== "object") continue;
     if (event.type === "response.output_item.done" && event.item) {
-      const index = Number.isInteger(event.output_index) ? event.output_index : items.length;
-      items[index] = event.item;
+      const index = event.output_index === undefined ? nextIndex : event.output_index;
+      if (!Number.isSafeInteger(index) || index < 0) {
+        return {
+          status: 502,
+          body: { error: {
+            type: "upstream_error",
+            code: "native_stream_invalid_output_index",
+            message: "The native response stream carried an invalid output index.",
+          } },
+        };
+      }
+      items.set(index, event.item);
+      nextIndex = Math.max(nextIndex, index + 1);
     } else if (TERMINAL_OK.has(event.type) && event.response) {
       terminal = event.response;
     } else if (TERMINAL_FAILED.has(event.type)) {
@@ -51,7 +67,9 @@ export function foldResponsesSse(text) {
     }
   }
   if (terminal && !failure) {
-    const collected = items.filter(Boolean);
+    const collected = [...items.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, item]) => item);
     const output = Array.isArray(terminal.output) && terminal.output.length > 0
       ? terminal.output
       : collected;

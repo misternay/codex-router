@@ -129,6 +129,56 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
+test("native image histories over 128 MiB can grow without losing the current batch", async () => {
+  const received = [];
+  const native = await mockServer(async (request, response) => {
+    received.push(await bodyJson(request));
+    json(response, 200, { id: "resp_visual", output: [], usage: { input_tokens: 100, output_tokens: 1 } });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}`,
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const oldImage = { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(3 * 1024 * 1024)}`, detail: "original" };
+    const history = [];
+    for (let index = 0; index < 47; index++) {
+      history.push(
+        { type: "function_call", call_id: `call_${index}`, name: "view_image", arguments: "{}" },
+        { type: "function_call_output", call_id: `call_${index}`, output: [oldImage] },
+      );
+    }
+    const current = Array.from({ length: 6 }, (_, index) => ({
+      type: "input_image", image_url: `data:image/png;base64,${Buffer.from(`current-${index}`).toString("base64")}`, detail: "original",
+    }));
+    history.push(
+      { type: "function_call", call_id: "current", name: "view_image", arguments: "{}" },
+      { type: "function_call_output", call_id: "current", output: current },
+    );
+    for (let round = 0; round < 2; round++) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST", headers: { Authorization: "Bearer native-test", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "native-visual-test", input: history, stream: false }),
+      });
+      assert.equal(response.status, 200, `${await response.text()} ${router.testErrors()}`);
+      assert.deepEqual(received.at(-1).input.at(-1).output, current);
+      assert.ok(JSON.stringify(received.at(-1)).length < 35 * 1024 * 1024);
+      assert.ok(received.at(-1).input.some((item) => item.output?.[0]?.text?.includes("image omitted")));
+      history.unshift(
+        { type: "function_call", call_id: "older", name: "view_image", arguments: "{}" },
+        { type: "function_call_output", call_id: "older", output: [oldImage] },
+      );
+    }
+    assert.match(router.testErrors(), /bounded incoming image history/);
+    assert.doesNotMatch(router.testErrors(), /current-0/);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
 test("router health waits for enabled dependencies and ignores disabled forwarders", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-health-selection-"));
   writeFileSync(
@@ -1444,6 +1494,61 @@ test("router permits a compressed context larger than the encoded request limit"
 
     assert.equal(response.status, 200, await response.text());
     assert.equal(receivedInputLength, input.length);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
+test("Responses ingress preserves explicit wire and staged decoded limits", async () => {
+  const seen = [];
+  const native = await mockServer(async (request, response) => {
+    seen.push(await bodyJson(request));
+    json(response, 200, { id: "within-limits", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}`,
+    MODEL_ROUTER_MAX_BODY_BYTES: "256",
+    MODEL_ROUTER_MAX_DECODED_BODY_BYTES: "4096",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  function sendChunked(body, encoding) {
+    return new Promise((resolve, reject) => {
+      const request = http.request(`${routerBase(routerPort)}/responses`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...(encoding ? { "Content-Encoding": encoding } : {}) },
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      });
+      request.on("error", reject);
+      for (let offset = 0; offset < body.length; offset += 32) request.write(body.subarray(offset, offset + 32));
+      request.end();
+    });
+  }
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const uncompressed = Buffer.from(JSON.stringify({ model: "native-limit-test", input: "x".repeat(300) }));
+    assert.equal(await sendChunked(uncompressed), 413);
+    const incompressible = gzipSync(Buffer.from(JSON.stringify({
+      model: "native-limit-test", input: Array.from({ length: 120 }, (_, index) => `${index}: abc`).join("|"),
+    })));
+    assert.ok(incompressible.length > 256);
+    assert.equal(await sendChunked(incompressible, "gzip"), 413);
+    const accepted = gzipSync(Buffer.from(JSON.stringify({ model: "native-limit-test", input: "x".repeat(1_000) })));
+    assert.ok(accepted.length < 256);
+    assert.equal(await sendChunked(accepted, "gzip"), 200);
+    assert.equal(seen.length, 1);
+    const small = gzipSync(Buffer.from('{"model":"native-limit-test","input":"small"}'));
+    const header = Buffer.from(small.subarray(0, 10));
+    header[3] |= 0x10;
+    const intermediate = Buffer.concat([header, Buffer.alloc(65_536, 65), Buffer.from([0]), small.subarray(10)]);
+    const bomb = gzipSync(intermediate);
+    assert.ok(bomb.length < 256);
+    assert.equal(await sendChunked(bomb, "gzip, gzip"), 413);
+    assert.equal(seen.length, 1, "every rejection must happen before an upstream request");
+    assert.equal((await fetch(`${routerBase(routerPort)}/models`)).status, 200);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -3452,6 +3557,85 @@ test("router inlines an external parent's plaintext task before replaying to nat
     assert.equal(sentExternal.recipient, "/root/reviewer");
     // Genuine OpenAI ciphertext must reach the backend untouched.
     assert.deepEqual(sentNative, nativeParentTask);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
+test("native router recovers a deferred agents namespace from history", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 200, { id: "resp_native_close", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const headers = {
+    Authorization: "Bearer native-session-token",
+    "chatgpt-account-id": "native-test-account",
+    "Content-Type": "application/json",
+  };
+  const finishedChild = {
+    type: "agent_message",
+    author: "/root/native_regression_probe",
+    recipient: "/root",
+    content: [{
+      type: "input_text",
+      text:
+        "Message Type: FINAL_ANSWER\n" +
+        "Task name: /root\n" +
+        "Sender: /root/native_regression_probe\n" +
+        "Payload:\nfinished",
+    }],
+  };
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const replay = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        tools: [],
+        input: [
+          {
+            type: "function_call",
+            name: "spawn_agent",
+            namespace: "agents",
+            call_id: "call_spawn",
+            arguments: "{}",
+          },
+          {
+            type: "function_call",
+            name: "wait_agent",
+            namespace: "agents",
+            call_id: "call_wait",
+            arguments: "{}",
+          },
+          finishedChild,
+        ],
+      }),
+    });
+    const replayBody = await replay.text();
+    assert.equal(replay.status, 200, replayBody);
+    const replayed = JSON.parse(replayBody);
+    const injected = replayed.output.find((item) => item?.type === "function_call");
+    assert.deepEqual(
+      { name: injected?.name, namespace: injected?.namespace },
+      { name: "interrupt_agent", namespace: "agents" },
+    );
+    assert.deepEqual(JSON.parse(injected.arguments), {
+      target: "/root/native_regression_probe",
+    });
+
+    assert.equal(nativeRequests.length, 1);
+    assert.deepEqual(nativeRequests[0].tools, []);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -7718,6 +7902,15 @@ test("router replays verified search history without exposing a new search tool"
     id: "completed-search-history",
     status: "completed",
     action: { type: "search", query: "router contract" },
+  }, {
+    type: "web_search_call", id: "batched-history", status: "completed",
+    action: { type: "search", queries: ["router defaults", "router overrides"] },
+  }, {
+    type: "web_search_call", id: "opened-history", status: "completed",
+    action: { type: "open_page", url: "https://example.com/router" },
+  }, {
+    type: "web_search_call", id: "find-history", status: "failed",
+    action: { type: "find_in_page", url: "https://example.com/router", pattern: "override" },
   }];
 
   try {
@@ -7735,6 +7928,16 @@ test("router replays verified search history without exposing a new search tool"
       request.model === fixture.historyCompatible.gatewayModel &&
       (!Array.isArray(request.tools) || request.tools.every((tool) => tool.type !== "web_search"))
     )));
+    const markers = gatewayRequests[0].input.filter((item) => item.type === "message" && item.role === "assistant");
+    assert.deepEqual(markers.map((item) => item.content[0].text), [
+      "[completed web search: router contract]",
+      '[completed web search: queries=["router defaults","router overrides"]]',
+      "[completed web page open: https://example.com/router]",
+      '[web page find (failed): url="https://example.com/router", pattern="override"]',
+    ]);
+    // Compaction has its own quoted source catalog, which already preserves
+    // action details. Its original structured history remains unchanged.
+    assert.deepEqual(gatewayRequests[1].input.slice(0, history.length), history);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -9999,6 +10202,7 @@ test("routed compaction bounds the image payload like a routed turn", async () =
       { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(64)}${index}` },
     ],
   }));
+  images.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "Earlier screenshots were examined." }] });
 
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
@@ -10091,6 +10295,7 @@ for (const endpoint of ["responses", "responses/compact"]) {
         },
       ],
     }));
+    input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "Earlier screenshots were examined." }] });
 
     try {
       await waitFor(`${routerBase(routerPort)}/models`, router);
@@ -10433,6 +10638,7 @@ test("a live child turn refines a legacy experimental subagent diagnostic", asyn
     }
     json(response, 200, {
       id: "resp_child",
+      status: "completed",
       output: [
         { type: "message", content: [{ type: "output_text", text: "child done" }] },
       ],
@@ -14362,6 +14568,93 @@ function genericResponsesReasoningFixture() {
   })}\n`);
   return { dir, providersFile, userModelsFile };
 }
+
+test("generic openai-responses routes downgrade Codex agent handoffs on turns and compaction", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, {
+      id: "resp-generic-agent-message",
+      object: "response",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        },
+      ],
+    });
+  });
+  const fixture = genericResponsesReasoningFixture();
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: fixture.dir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: fixture.providersFile,
+    MODEL_ROUTER_USER_MODELS: fixture.userModelsFile,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const content = [
+    {
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n",
+    },
+    {
+      type: "encrypted_content",
+      encrypted_content: "Inspect the generic Responses route.",
+    },
+  ];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const endpoint of ["/responses", "/responses/compact"]) {
+      const response = await fetch(`${routerBase(routerPort)}${endpoint}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${CALLER_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "responses-gateway/thinker",
+          stream: false,
+          input: [
+            {
+              type: "agent_message",
+              id: "amsg_generic",
+              author: "/root",
+              recipient: "/root/worker",
+              content,
+            },
+          ],
+        }),
+      });
+      assert.equal(response.status, 200, `${endpoint}: ${await response.text()}\n${router.testErrors()}`);
+    }
+
+    assert.equal(gatewayBodies.length, 2);
+    for (const [index, body] of gatewayBodies.entries()) {
+      assert.deepEqual(body.input[0], {
+        type: "message",
+        role: "user",
+        content: [
+          content[0],
+          { type: "input_text", text: "Inspect the generic Responses route." },
+        ],
+      });
+      assert.equal(
+        body.input.some((item) => item?.type === "agent_message"),
+        false,
+        index === 0 ? "ordinary turn retained agent_message" : "compaction retained agent_message",
+      );
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
 
 for (const [label, model, generic] of [
   ["a generic openai-responses route", "responses-gateway/thinker", true],

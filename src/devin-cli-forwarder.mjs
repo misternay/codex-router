@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import {
   applyKeepAliveTimeouts,
   endStreamedResponse,
-  formatErrorChain,
   httpErrorStatus,
   installGracefulShutdown,
   readRequestBody,
@@ -19,6 +18,7 @@ import { PORTS } from "./paths.mjs";
 import { devinCliStatus } from "./devin-cli-status.mjs";
 import { readDevinSession } from "./devin-cli-session.mjs";
 import { connectServerStream, connectUnary } from "./devin-connect.mjs";
+import { isKnownConnectCode } from "./connect-stream-audit.mjs";
 import {
   GET_CLI_MODEL_CONFIGS,
   GET_CLI_MODEL_CONFIGS_REQUEST,
@@ -28,7 +28,7 @@ import {
   GET_CHAT_MESSAGE_RESPONSE,
   SERVICE_PATH,
 } from "./devin-proto.mjs";
-import { buildChatMessageRequest, finishReasonFor, usageFrom } from "./devin-cli-turn.mjs";
+import { buildChatMessageRequest, finishReasonFor, usageFrom, ToolCallStream } from "./devin-cli-turn.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 
 installStableFetchTransport();
@@ -46,6 +46,73 @@ function baseUrlFor(session) {
   return process.env.DEVIN_CASCADE_BASE_URL || session.apiServerUrl;
 }
 
+function safeErrorCode(error) {
+  const code = error?.code;
+  if (code === "devin_compressed_frame") return code;
+  if (typeof code !== "string" || code.length > 64 || !code.startsWith("devin_")) return null;
+  const connectCode = code.slice("devin_".length);
+  return isKnownConnectCode(connectCode) ? `devin_${connectCode.toLowerCase()}` : null;
+}
+
+function permissionDeniedBillingKind(detail) {
+  // These are the two wrappers authored by devin-connect.mjs. Strip one only;
+  // quoted/suffix prompt or tool text must never become a billing diagnosis.
+  const prefix = [
+    "Devin upstream refused the request: ",
+    "Devin upstream ended the stream: ",
+  ].find((value) => detail.startsWith(value));
+  const offset = prefix?.length || 0;
+  const diagnostic = detail.slice(offset, offset + 256).trimStart();
+  // This provider has no verified structured billing subcode. Recognize only
+  // the bounded initial account-limit sentences the fixture actually proves;
+  // every ambiguous permission refusal retains permission_error.
+  if (/^Your quota is exhausted\.(?:\s|$)/i.test(diagnostic)) return "out_of_usage";
+  if (/^Your plan does not include this API\.(?:\s|$)/i.test(diagnostic)) return "entitlement";
+  return undefined;
+}
+
+function requestFailure(error) {
+  const status = httpErrorStatus(error, 502);
+  const code = safeErrorCode(error);
+  let message = "The Devin CLI forwarder could not complete the request.";
+  let type = "api_error";
+  if (status === 401) {
+    message = "Devin rejected the CLI session; run `devin auth login`.";
+    type = "authentication_error";
+  } else if (status === 403 && code === "devin_permission_denied") {
+    // Error prose can echo tokens, URLs, prompts and tool descriptions. Keep
+    // only an owned diagnosis, whose prefix survives LiteLLM's error wrappers.
+    const detail = typeof error?.message === "string" ? error.message : "";
+    const prefix = "Devin refused this request (devin_permission_denied):";
+    type = "permission_error";
+    if (/\bMCP\s+configuration\b/i.test(detail)) {
+      message = `${prefix} the upstream reported an MCP configuration issue.`;
+    } else if (/\bcontent[\s_-]+policy\b/i.test(detail)) {
+      message = `${prefix} the upstream reported a content policy refusal.`;
+    } else {
+      // Preserve a proved initial account-limit diagnosis. Arbitrary prose
+      // can echo a denied prompt, and its quota wording must not cause failover.
+      const kind = permissionDeniedBillingKind(detail);
+      if (kind === "entitlement") {
+        message = "This Devin plan does not include this API.";
+        type = "billing_error";
+      } else if (kind === "out_of_usage") {
+        message = "Devin reports that its quota is exhausted.";
+        type = "billing_error";
+      } else {
+        message = `${prefix} check the account permissions and team or tool configuration.`;
+      }
+    }
+  }
+  return { status, error: { message, type, code } };
+}
+
+function logRequestFailure(failure) {
+  // Only allowlisted codes: even an upstream code can contain prompt text or
+  // credentials. Never log the original error, message, body or cause chain.
+  console.error(`[devin-cli] request failed: status=${failure.status} code=${failure.error.code || "unknown"}`);
+}
+
 const chunk = (id, created, model, delta, finishReason = null) =>
   `data: ${JSON.stringify({
     id,
@@ -55,36 +122,7 @@ const chunk = (id, created, model, delta, finishReason = null) =>
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   })}\n\n`;
 
-// Cascade streams whole tool calls rather than argument fragments, so a call
-// arriving twice is the same call restated. Indexing by id keeps the OpenAI
-// `tool_calls[].index` stable across restatements instead of emitting a second
-// call the client would dispatch twice.
-class ToolCallStream {
-  constructor() {
-    this.byId = new Map();
-    this.collected = [];
-  }
-
-  accept(call) {
-    const id = call.id || `call_${randomUUID()}`;
-    const existing = this.byId.get(id);
-    const entry = {
-      id,
-      type: "function",
-      function: { name: call.name || existing?.function.name || "", arguments: call.argumentsJson || "" },
-    };
-    if (existing) {
-      const index = this.collected.findIndex((held) => held.id === id);
-      this.collected[index] = entry;
-      this.byId.set(id, entry);
-      return { index, entry, restated: true };
-    }
-    const index = this.collected.length;
-    this.collected.push(entry);
-    this.byId.set(id, entry);
-    return { index, entry, restated: false };
-  }
-}
+export { ToolCallStream } from "./devin-cli-turn.mjs";
 
 async function handleChatCompletions(request, response) {
   const chat = JSON.parse((await readRequestBody(request)).toString("utf8"));
@@ -155,13 +193,14 @@ async function handleChatCompletions(request, response) {
         if (wantsStream) response.write(chunk(id, created, model, { content: message.deltaText }));
       }
       for (const call of message.deltaToolCalls || []) {
-        const { index, entry, restated } = toolCalls.accept(call);
-        if (!wantsStream) continue;
+        if (!call.name && !call.argumentsJson) continue;
+        const { index, entry, restated, argumentDelta } = toolCalls.accept(call);
+        if (!wantsStream || (restated && !argumentDelta)) continue;
         response.write(
           chunk(id, created, model, {
             tool_calls: [
               restated
-                ? { index, function: { arguments: entry.function.arguments } }
+                ? { index, function: { arguments: argumentDelta } }
                 : { index, id: entry.id, type: "function", function: { ...entry.function } },
             ],
           }),
@@ -171,25 +210,17 @@ async function handleChatCompletions(request, response) {
       if (message.stopReason !== undefined) stopReason = message.stopReason;
     }
   } catch (error) {
+    const failure = requestFailure(error);
+    logRequestFailure(failure);
     if (!headersWritten) {
-      const status = httpErrorStatus(error, 502);
-      writeJson(response, status, {
-        error: {
-          message:
-            status === 401
-              ? "Devin rejected the CLI session; run `devin auth login`."
-              : "The Devin CLI forwarder could not complete the request.",
-          type: status === 401 ? "authentication_error" : "api_error",
-          code: null,
-        },
-      });
+      writeJson(response, failure.status, { error: failure.error });
       return;
     }
     // The turn already relayed bytes, so an ordinary [DONE] would certify a
     // partial message as complete. Report the failure in-band, then end the
     // HTTP body cleanly instead of resetting the socket.
     endStreamedResponse(response, {
-      message: "The Devin CLI forwarder lost the upstream response stream.",
+      message: failure.error.message,
     });
     return;
   }
@@ -234,7 +265,15 @@ export async function listCascadeModels({ session = readDevinSession(), signal }
     token: session.apiKey,
     requestSchema: GET_CLI_MODEL_CONFIGS_REQUEST,
     responseSchema: GET_CLI_MODEL_CONFIGS_RESPONSE,
-    message: { metadata: { apiKey: session.apiKey, ideName: "windsurf", locale: "en" } },
+    message: {
+      metadata: {
+        apiKey: session.apiKey,
+        ideName: "chisel",
+        ideVersion: "0.0.0-dev",
+        extensionVersion: "0.0.0-dev",
+        locale: "en",
+      },
+    },
     signal,
   });
   return (response.clientModelConfigs || [])
@@ -295,20 +334,13 @@ if (isMain) {
   if (!INTERNAL_KEY) throw new Error("MODEL_ROUTER_INTERNAL_KEY is required.");
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {
-      const status = httpErrorStatus(error);
-      // Names and codes only: upstream text can carry prompt content, and
-      // bodies never belong in the log.
-      console.error(`[devin-cli] request failed: ${formatErrorChain(error, { messages: false })}`);
+      const failure = requestFailure(error);
+      logRequestFailure(failure);
       if (!response.headersSent) {
-        writeJson(response, status, {
-          error: {
-            type: status >= 500 ? "api_error" : "invalid_request_error",
-            message: "The Devin CLI forwarder could not complete the request.",
-          },
-        });
+        writeJson(response, failure.status, { error: failure.error });
       } else if (!response.writableEnded) {
         endStreamedResponse(response, {
-          message: "The Devin CLI forwarder lost the upstream response stream.",
+          message: failure.error.message,
         });
       }
     });
